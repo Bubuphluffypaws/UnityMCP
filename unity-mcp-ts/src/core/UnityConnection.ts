@@ -15,7 +15,7 @@ export class UnityConnection extends EventEmitter {
     private activeClientId: string | null = null;
     private port: number = 27182; // Default port
     private host: string = '127.0.0.1';
-    private pendingRequests: Map<string, { resolve: (value: JObject) => void, reject: (reason: Error) => void }> = new Map();
+    private pendingRequests: Map<string, { resolve: (value: JObject) => void, reject: (reason: Error) => void, timer: ReturnType<typeof setTimeout>, clientId: string }> = new Map();
     private requestId: number = 0;
     private clientDataBuffers: Map<string, string> = new Map();
     private clientInfoMap: Map<string, any> = new Map();
@@ -97,6 +97,11 @@ export class UnityConnection extends EventEmitter {
                     // Handle disconnection
                     socket.on('close', () => {
                         console.error(`[INFO] Unity client disconnected: ${clientId}`);
+
+                        // Reject all pending requests for this client immediately
+                        // instead of waiting for the 30-second timeout
+                        this.rejectPendingRequestsForClient(clientId);
+
                         this.clients.delete(clientId);
                         this.clientDataBuffers.delete(clientId);
                         this.clientInfoMap.delete(clientId);
@@ -282,22 +287,24 @@ export class UnityConnection extends EventEmitter {
                 const id = response.id as string;
                 const result = response.result as JObject;
 
-                // Resolve pending request
-                if (this.pendingRequests.has(id)) {
-                    const { resolve } = this.pendingRequests.get(id)!;
+                // Resolve pending request and clear timeout
+                const pending = this.pendingRequests.get(id);
+                if (pending) {
+                    clearTimeout(pending.timer);
                     this.pendingRequests.delete(id);
-                    resolve(result);
+                    pending.resolve(result);
                 }
             }
             // Handle regular response with just an ID
             else if (response.id) {
                 const id = response.id as string;
 
-                // Resolve pending request
-                if (this.pendingRequests.has(id)) {
-                    const { resolve } = this.pendingRequests.get(id)!;
+                // Resolve pending request and clear timeout
+                const pending = this.pendingRequests.get(id);
+                if (pending) {
+                    clearTimeout(pending.timer);
                     this.pendingRequests.delete(id);
-                    resolve(response);
+                    pending.resolve(response);
                 }
             }
             // Handle push notification or event from Unity
@@ -417,6 +424,7 @@ export class UnityConnection extends EventEmitter {
             try {
                 // Add request ID for tracking
                 const id = (++this.requestId).toString();
+                const activeClient = this.activeClientId as string;
                 const requestWithId: JObject = {
                     command: request.command,
                     type: request.type || '',
@@ -424,32 +432,41 @@ export class UnityConnection extends EventEmitter {
                     id
                 };
 
-                console.error(`[DEBUG] Sending request to ${this.activeClientId}: ${JSON.stringify(requestWithId)}`);
+                console.error(`[DEBUG] Sending request to ${activeClient}: ${JSON.stringify(requestWithId)}`);
 
-                // Store the promise callbacks
-                this.pendingRequests.set(id, { resolve, reject });
+                // Get the active client socket — re-check after initial guard
+                // to handle race where client disconnects between check and write
+                const socket = this.clients.get(activeClient);
+                if (!socket) {
+                    reject(new Error(`Client ${activeClient} disconnected before request could be sent`));
+                    return;
+                }
 
-                // Get the active client socket
-                const socket = this.clients.get(this.activeClientId as string)!;
+                // Set timeout to prevent hanging requests (store timer for cleanup)
+                const timer = setTimeout(() => {
+                    if (this.pendingRequests.has(id)) {
+                        console.error(`[ERROR] Request with ID ${id} timed out`);
+                        this.pendingRequests.delete(id);
+                        reject(new Error('Request timed out'));
+                    }
+                }, 30000);
+
+                // Store the promise callbacks with timer and client ID for cleanup
+                this.pendingRequests.set(id, { resolve, reject, timer, clientId: activeClient });
 
                 // Send the request
                 const data = JSON.stringify(requestWithId) + '\n';
                 socket.write(data, (err) => {
                     if (err) {
                         console.error(`[ERROR] Failed to send data to Unity: ${err.message}`);
-                        this.pendingRequests.delete(id);
+                        const pending = this.pendingRequests.get(id);
+                        if (pending) {
+                            clearTimeout(pending.timer);
+                            this.pendingRequests.delete(id);
+                        }
                         reject(err);
                     }
                 });
-
-                // Set timeout to prevent hanging requests
-                setTimeout(() => {
-                    if (this.pendingRequests.has(id)) {
-                        console.error(`[ERROR] Request with ID ${id} timed out`);
-                        this.pendingRequests.delete(id);
-                        reject(new Error('Request timed out'));
-                    }
-                }, 30000); // 30 seconds timeout
             } catch (err) {
                 console.error(`[ERROR] Error sending request: ${err instanceof Error ? err.message : String(err)}`);
                 reject(err);
@@ -480,9 +497,32 @@ export class UnityConnection extends EventEmitter {
     }
 
     /**
-     * Stops the server and closes all connections.
+     * Rejects all pending requests that were sent to a specific client.
+     * Called when a client disconnects to give immediate error feedback
+     * instead of waiting for the 30-second timeout.
      */
-    public stop(): void {
+    private rejectPendingRequestsForClient(clientId: string): void {
+        for (const [id, pending] of this.pendingRequests) {
+            if (pending.clientId === clientId) {
+                clearTimeout(pending.timer);
+                this.pendingRequests.delete(id);
+                pending.reject(new Error(`Unity client ${clientId} disconnected`));
+            }
+        }
+    }
+
+    /**
+     * Stops the server and closes all connections.
+     * Returns a promise that resolves when the server is fully closed.
+     */
+    public stop(): Promise<void> {
+        // Reject all pending requests with timer cleanup
+        for (const [id, pending] of this.pendingRequests) {
+            clearTimeout(pending.timer);
+            pending.reject(new Error('Connection closed'));
+        }
+        this.pendingRequests.clear();
+
         // Close all client connections
         for (const [clientId, socket] of this.clients.entries()) {
             console.error(`[INFO] Closing connection to client: ${clientId}`);
@@ -494,19 +534,18 @@ export class UnityConnection extends EventEmitter {
         this.clientInfoMap.clear();
         this.activeClientId = null;
 
-        // Close the server
-        if (this.server) {
-            this.server.close(() => {
-                console.error(`[INFO] Server stopped`);
-                this.emit('serverStopped');
-            });
-            this.server = null;
-        }
-
-        // Reject all pending requests
-        for (const [id, { reject }] of this.pendingRequests) {
-            reject(new Error('Connection closed'));
-            this.pendingRequests.delete(id);
-        }
+        // Close the server and wait for it to finish
+        return new Promise((resolve) => {
+            if (this.server) {
+                this.server.close(() => {
+                    console.error(`[INFO] Server stopped`);
+                    this.emit('serverStopped');
+                    resolve();
+                });
+                this.server = null;
+            } else {
+                resolve();
+            }
+        });
     }
 }
