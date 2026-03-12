@@ -31,6 +31,9 @@ namespace UnityMCP.Editor.Core
         {
             try
             {
+                // Unregister play mode handler to prevent accumulation across reloads
+                EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
+
                 if (McpServiceManager.Instance.TryGetService<McpServer>(out var server))
                 {
                     server.Dispose();

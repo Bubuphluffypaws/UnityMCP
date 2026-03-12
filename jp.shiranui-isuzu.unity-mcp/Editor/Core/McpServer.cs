@@ -186,6 +186,8 @@ namespace UnityMCP.Editor.Core
             this.running = false;
 
             this.cancellationTokenSource?.Cancel();
+            this.cancellationTokenSource?.Dispose();
+            this.cancellationTokenSource = null;
 
             if (this.client != null)
             {
@@ -607,81 +609,96 @@ namespace UnityMCP.Editor.Core
         {
             // Add incoming data to any incomplete data from previous receives
             var fullData = this.incompleteData + data;
+            this.incompleteData = "";
 
-            try
+            // Split on newline — TCP can deliver multiple JSON messages in one read
+            var segments = fullData.Split('\n');
+
+            for (var i = 0; i < segments.Length; i++)
             {
-                // Try to parse the data as JSON
-                var command = JObject.Parse(fullData);
-                this.incompleteData = ""; // Reset incomplete data if successful
+                var segment = segments[i].Trim();
+                if (string.IsNullOrEmpty(segment)) continue;
 
-                if (DetailedLogs)
+                // Last segment may be incomplete if it wasn't terminated by \n
+                var isLastSegment = i == segments.Length - 1;
+
+                try
                 {
-                    Debug.Log($"[McpClient] Received command: {command}");
-                }
-
-                // Process the command based on its type
-                var responseType = command["type"]?.ToString();
-                JObject response;
-
-                if (responseType == "resource")
-                {
-                    // Handle resource request
-                    response = this.ProcessResourceRequest(command);
-                }
-                else
-                {
-                    // Default to command execution
-                    response = this.ExecuteCommand(command);
-                }
-
-                // Send response
-                if (!this.IsConnected) return;
-
-                var responseJson = JsonConvert.SerializeObject(response);
-                var responseBytes = Encoding.UTF8.GetBytes(responseJson + "\n");
-                var stream = this.client.GetStream();
-                stream.Write(responseBytes, 0, responseBytes.Length);
-
-                if (DetailedLogs)
-                {
-                    Debug.Log($"[McpClient] Sent response: {responseJson}");
-                }
-            }
-            catch (JsonReaderException)
-            {
-                // If JSON is incomplete, store it for the next receive
-                this.incompleteData = fullData;
-
-                if (DetailedLogs)
-                {
-                    Debug.Log($"[McpClient] Received incomplete JSON data, buffering for next receive");
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"Error processing command: {e.Message}");
-
-                // Send error response
-                if (this.IsConnected)
-                {
-                    var errorResponse = new JObject
-                    {
-                        ["status"] = "error",
-                        ["message"] = e.Message
-                    };
-
-                    var errorJson = JsonConvert.SerializeObject(errorResponse);
-                    var errorBytes = Encoding.UTF8.GetBytes(errorJson + "\n");
-                    var stream = this.client.GetStream();
-                    stream.Write(errorBytes, 0, errorBytes.Length);
+                    var command = JObject.Parse(segment);
 
                     if (DetailedLogs)
                     {
-                        Debug.Log($"[McpClient] Sent error response: {errorJson}");
+                        Debug.Log($"[McpClient] Received command: {command}");
+                    }
+
+                    // Process the command based on its type
+                    var responseType = command["type"]?.ToString();
+                    JObject response;
+
+                    if (responseType == "resource")
+                    {
+                        response = this.ProcessResourceRequest(command);
+                    }
+                    else
+                    {
+                        response = this.ExecuteCommand(command);
+                    }
+
+                    // Send response
+                    if (!this.IsConnected) return;
+
+                    var responseJson = JsonConvert.SerializeObject(response);
+                    var responseBytes = Encoding.UTF8.GetBytes(responseJson + "\n");
+                    var stream = this.client.GetStream();
+                    stream.Write(responseBytes, 0, responseBytes.Length);
+
+                    if (DetailedLogs)
+                    {
+                        Debug.Log($"[McpClient] Sent response: {responseJson}");
                     }
                 }
+                catch (JsonReaderException)
+                {
+                    if (isLastSegment)
+                    {
+                        // Last segment wasn't valid JSON — buffer it for the next receive
+                        this.incompleteData = segment;
 
-                this.incompleteData = ""; // Reset incomplete data
+                        if (DetailedLogs)
+                        {
+                            Debug.Log($"[McpClient] Buffering incomplete JSON segment for next receive");
+                        }
+                    }
+                    else
+                    {
+                        // Mid-stream segment that isn't valid JSON — something is wrong, skip it
+                        Debug.LogWarning($"[McpClient] Skipping malformed JSON segment: {segment.Substring(0, Math.Min(100, segment.Length))}");
+                    }
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"Error processing command: {e.Message}");
+
+                    // Send error response
+                    if (this.IsConnected)
+                    {
+                        var errorResponse = new JObject
+                        {
+                            ["status"] = "error",
+                            ["message"] = e.Message
+                        };
+
+                        var errorJson = JsonConvert.SerializeObject(errorResponse);
+                        var errorBytes = Encoding.UTF8.GetBytes(errorJson + "\n");
+                        var stream = this.client.GetStream();
+                        stream.Write(errorBytes, 0, errorBytes.Length);
+
+                        if (DetailedLogs)
+                        {
+                            Debug.Log($"[McpClient] Sent error response: {errorJson}");
+                        }
+                    }
+                }
             }
         }
 
@@ -787,19 +804,24 @@ namespace UnityMCP.Editor.Core
         /// </summary>
         private void ProcessMainThreadQueue()
         {
+            // Drain under lock, execute outside — avoids blocking enqueuers during slow handlers
+            Action[] pending;
             lock (this.queueLock)
             {
-                while (this.mainThreadQueue.Count > 0)
+                if (this.mainThreadQueue.Count == 0) return;
+                pending = this.mainThreadQueue.ToArray();
+                this.mainThreadQueue.Clear();
+            }
+
+            foreach (var action in pending)
+            {
+                try
                 {
-                    var action = this.mainThreadQueue.Dequeue();
-                    try
-                    {
-                        action();
-                    }
-                    catch (Exception e)
-                    {
-                        Debug.LogError($"Error executing action on main thread: {e.Message}");
-                    }
+                    action();
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"Error executing action on main thread: {e.Message}");
                 }
             }
         }
