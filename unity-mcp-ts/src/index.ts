@@ -96,30 +96,31 @@ async function main() {
   }
 }
 
-// Shutdown handling
-process.on("SIGINT", () => {
-  console.error("[INFO] Shutting down...");
-  const unityConnection = UnityConnection.getInstance();
-  unityConnection.stop();
+// Shutdown handling — await server close before exiting
+async function shutdown(signal: string) {
+  console.error(`[INFO] ${signal} received, shutting down...`);
+  try {
+    const unityConnection = UnityConnection.getInstance();
+    await unityConnection.stop();
+  } catch (err) {
+    console.error(`[ERROR] Error during shutdown: ${err instanceof Error ? err.message : String(err)}`);
+  }
   process.exit(0);
-});
+}
 
-process.on("SIGTERM", () => {
-  console.error("[INFO] Shutting down...");
-  const unityConnection = UnityConnection.getInstance();
-  unityConnection.stop();
-  process.exit(0);
-});
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-// Handle uncaught exceptions to prevent crashing
+// Handle uncaught exceptions — clean up and exit rather than running in corrupted state
 process.on('uncaughtException', (error) => {
   const errorCode = 'code' in error ? `[Code: ${(error as any).code}] ` : '';
   console.error(`[ERROR] Uncaught exception: ${errorCode}${error.message}`);
   console.error(error.stack);
-  // Do not exit the process
+  // Shut down cleanly — continuing after uncaughtException is unsafe per Node.js docs
+  shutdown("uncaughtException").catch(() => process.exit(1));
 });
 
-// Handle unhandled promise rejections to prevent crashing
+// Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
   if (reason instanceof Error) {
     const errorCode = 'code' in reason ? `[Code: ${(reason as any).code}] ` : '';
@@ -129,7 +130,7 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('[ERROR] Unhandled Promise rejection at:', promise);
     console.error('Reason:', reason);
   }
-  // Do not exit the process
+  // Don't exit for unhandled rejections — they're less dangerous than uncaught exceptions
 });
 
 // Execute main function

@@ -6,7 +6,7 @@ import { BaseCommandHandler } from "../core/BaseCommandHandler.js";
 /**
  * Command handler for executing Unity menu items.
  */
-export abstract class MenuItemCommandHandler extends BaseCommandHandler {
+export class MenuItemCommandHandler extends BaseCommandHandler {
     /**
      * Gets the command prefix for this handler.
      */
@@ -27,7 +27,7 @@ export abstract class MenuItemCommandHandler extends BaseCommandHandler {
      * @param parameters The parameters for the command.
      * @returns A Promise that resolves to a JSON object containing the execution result.
      */
-    public async execute(action: string, parameters: JObject): Promise<JObject> {
+    protected async executeCommand(action: string, parameters: JObject): Promise<JObject> {
         if (action.toLowerCase() !== "execute") {
             return {
                 success: false,
