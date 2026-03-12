@@ -153,6 +153,11 @@ namespace UnityMCP.Editor.Core
 
             try
             {
+                // Re-read host/port from settings in case they changed
+                var settings = McpSettings.instance;
+                this.host = settings.host;
+                this.port = settings.port;
+
                 this.cancellationTokenSource = new CancellationTokenSource();
 
                 // Start client on a separate thread

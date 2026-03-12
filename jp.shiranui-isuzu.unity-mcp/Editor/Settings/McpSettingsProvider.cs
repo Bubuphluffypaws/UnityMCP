@@ -159,6 +159,13 @@ namespace UnityMCP.Editor.Settings
             if (EditorGUI.EndChangeCheck())
             {
                 settings.Save();
+
+                // If host or port changed, restart the server so it connects to the new target
+                if (this.mcpServer != null && this.mcpServer.IsRunning)
+                {
+                    this.mcpServer.Stop();
+                    this.mcpServer.Start();
+                }
             }
         }
 
