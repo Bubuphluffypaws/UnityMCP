@@ -1,4 +1,5 @@
-﻿using UnityEditor;
+﻿using System;
+using UnityEditor;
 using UnityEngine;
 using UnityMCP.Editor.Resources;
 using UnityMCP.Editor.Settings;
@@ -13,10 +14,33 @@ namespace UnityMCP.Editor.Core
     {
         /// <summary>
         /// Initializes the MCP system when the Unity editor starts.
+        /// Also hooks into assembly reload to cleanly dispose the old server
+        /// before domain reload destroys all static state.
         /// </summary>
         static McpEditorInitializer()
         {
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             EditorApplication.delayCall += Initialize;
+        }
+
+        /// <summary>
+        /// Disposes the existing MCP server before domain reload wipes static state.
+        /// Without this, the old TcpClient/threads leak since finalizers aren't guaranteed.
+        /// </summary>
+        private static void OnBeforeAssemblyReload()
+        {
+            try
+            {
+                if (McpServiceManager.Instance.TryGetService<McpServer>(out var server))
+                {
+                    server.Dispose();
+                    McpServiceManager.Instance.RemoveService<McpServer>();
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[McpEditorInitializer] Error during pre-reload cleanup: {e.Message}");
+            }
         }
 
         /// <summary>
@@ -25,6 +49,14 @@ namespace UnityMCP.Editor.Core
         private static void Initialize()
         {
             Debug.Log("Initializing Unity MCP system...");
+
+            // Dispose any leftover server from a previous domain (belt-and-suspenders)
+            if (McpServiceManager.Instance.TryGetService<McpServer>(out var oldServer))
+            {
+                Debug.Log("[McpEditorInitializer] Disposing leftover MCP server from previous domain");
+                oldServer.Dispose();
+                McpServiceManager.Instance.RemoveService<McpServer>();
+            }
 
             // Create and register the MCP server
             var settings = McpSettings.instance;
