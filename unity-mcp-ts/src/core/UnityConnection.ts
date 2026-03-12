@@ -295,6 +295,18 @@ export class UnityConnection extends EventEmitter {
                     pending.resolve(result);
                 }
             }
+            // Handle error response from Unity
+            else if (response.status === "error" && response.id) {
+                const id = response.id as string;
+
+                const pending = this.pendingRequests.get(id);
+                if (pending) {
+                    clearTimeout(pending.timer);
+                    this.pendingRequests.delete(id);
+                    const errorMsg = (response.error ?? response.message ?? "Unity returned an error") as string;
+                    pending.reject(new Error(errorMsg));
+                }
+            }
             // Handle regular response with just an ID
             else if (response.id) {
                 const id = response.id as string;

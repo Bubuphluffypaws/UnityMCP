@@ -6,7 +6,7 @@ import { BaseCommandHandler } from "../core/BaseCommandHandler.js";
 /**
  * Command handler for accessing and managing Unity Console logs.
  */
-export abstract class ConsoleCommandHandler extends BaseCommandHandler {
+export class ConsoleCommandHandler extends BaseCommandHandler {
     /**
      * Gets the command prefix for this handler.
      */
@@ -27,7 +27,7 @@ export abstract class ConsoleCommandHandler extends BaseCommandHandler {
      * @param parameters The parameters for the command.
      * @returns A Promise that resolves to a JSON object containing the execution result.
      */
-    public async execute(action: string, parameters: JObject): Promise<JObject> {
+    protected async executeCommand(action: string, parameters: JObject): Promise<JObject> {
         switch (action.toLowerCase()) {
             case "getlogs":
                 return this.getLogs(parameters);
