@@ -21,7 +21,7 @@ namespace UnityMCP.Editor.Core
         // Server configuration
         private string host;
         private int port;
-        private bool running;
+        private volatile bool running;
         private TcpClient client;
         private Thread clientThread;
         private readonly byte[] buffer = new byte[8192];
@@ -186,6 +186,8 @@ namespace UnityMCP.Editor.Core
             this.running = false;
 
             this.cancellationTokenSource?.Cancel();
+            this.cancellationTokenSource?.Dispose();
+            this.cancellationTokenSource = null;
 
             if (this.client != null)
             {
@@ -339,12 +341,17 @@ namespace UnityMCP.Editor.Core
                     {
                         var host = serverInfo["host"]?.ToString();
                         var port = serverInfo["port"]?.Value<int>() ?? 0;
-                        this.ExecuteOnMainThread(() =>
+
+                        // Validate host - reject unroutable addresses from broadcast
+                        if (IsValidHost(host) && port > 0)
                         {
-                            this.host = host;
-                            this.port = port;
-                            this.TryConnect();
-                        });
+                            this.ExecuteOnMainThread(() =>
+                            {
+                                this.host = host;
+                                this.port = port;
+                                this.TryConnect();
+                            });
+                        }
                         return;
                     }
                     // Verify this is an MCP server announcement
@@ -354,7 +361,8 @@ namespace UnityMCP.Editor.Core
                         var port = serverInfo["port"]?.Value<int>() ?? 0;
                         var version = serverInfo["version"]?.ToString();
 
-                        if (!string.IsNullOrEmpty(host) && port > 0)
+                        // Validate host - reject unroutable addresses from broadcast
+                        if (IsValidHost(host) && port > 0)
                         {
                             // Execute on main thread
                             this.ExecuteOnMainThread(() =>
@@ -376,6 +384,17 @@ namespace UnityMCP.Editor.Core
             {
                 Debug.LogWarning($"[McpServer] Failed to process UDP broadcast: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Validates that a host address from a UDP broadcast is routable.
+        /// Rejects null/empty, wildcard (0.0.0.0), and IPv6 unspecified (::) addresses.
+        /// </summary>
+        private static bool IsValidHost(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return false;
+            if (host == "0.0.0.0" || host == "::" || host == "[::]") return false;
+            return true;
         }
 
         /// <summary>
@@ -471,6 +490,9 @@ namespace UnityMCP.Editor.Core
                     this.currentReconnectDelay = this.reconnectDelay;
                     this.isReconnecting = false;
                     this.connectedSince = DateTime.Now;
+
+                    // Clear stale data from previous connection
+                    this.incompleteData = "";
 
                     Debug.Log($"Connected to MCP TypeScript server at {this.host}:{this.port}");
 
@@ -587,81 +609,96 @@ namespace UnityMCP.Editor.Core
         {
             // Add incoming data to any incomplete data from previous receives
             var fullData = this.incompleteData + data;
+            this.incompleteData = "";
 
-            try
+            // Split on newline — TCP can deliver multiple JSON messages in one read
+            var segments = fullData.Split('\n');
+
+            for (var i = 0; i < segments.Length; i++)
             {
-                // Try to parse the data as JSON
-                var command = JObject.Parse(fullData);
-                this.incompleteData = ""; // Reset incomplete data if successful
+                var segment = segments[i].Trim();
+                if (string.IsNullOrEmpty(segment)) continue;
 
-                if (DetailedLogs)
+                // Last segment may be incomplete if it wasn't terminated by \n
+                var isLastSegment = i == segments.Length - 1;
+
+                try
                 {
-                    Debug.Log($"[McpClient] Received command: {command}");
-                }
-
-                // Process the command based on its type
-                var responseType = command["type"]?.ToString();
-                JObject response;
-
-                if (responseType == "resource")
-                {
-                    // Handle resource request
-                    response = this.ProcessResourceRequest(command);
-                }
-                else
-                {
-                    // Default to command execution
-                    response = this.ExecuteCommand(command);
-                }
-
-                // Send response
-                if (!this.IsConnected) return;
-
-                var responseJson = JsonConvert.SerializeObject(response);
-                var responseBytes = Encoding.UTF8.GetBytes(responseJson + "\n");
-                var stream = this.client.GetStream();
-                stream.Write(responseBytes, 0, responseBytes.Length);
-
-                if (DetailedLogs)
-                {
-                    Debug.Log($"[McpClient] Sent response: {responseJson}");
-                }
-            }
-            catch (JsonReaderException)
-            {
-                // If JSON is incomplete, store it for the next receive
-                this.incompleteData = fullData;
-
-                if (DetailedLogs)
-                {
-                    Debug.Log($"[McpClient] Received incomplete JSON data, buffering for next receive");
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"Error processing command: {e.Message}");
-
-                // Send error response
-                if (this.IsConnected)
-                {
-                    var errorResponse = new JObject
-                    {
-                        ["status"] = "error",
-                        ["message"] = e.Message
-                    };
-
-                    var errorJson = JsonConvert.SerializeObject(errorResponse);
-                    var errorBytes = Encoding.UTF8.GetBytes(errorJson + "\n");
-                    var stream = this.client.GetStream();
-                    stream.Write(errorBytes, 0, errorBytes.Length);
+                    var command = JObject.Parse(segment);
 
                     if (DetailedLogs)
                     {
-                        Debug.Log($"[McpClient] Sent error response: {errorJson}");
+                        Debug.Log($"[McpClient] Received command: {command}");
+                    }
+
+                    // Process the command based on its type
+                    var responseType = command["type"]?.ToString();
+                    JObject response;
+
+                    if (responseType == "resource")
+                    {
+                        response = this.ProcessResourceRequest(command);
+                    }
+                    else
+                    {
+                        response = this.ExecuteCommand(command);
+                    }
+
+                    // Send response
+                    if (!this.IsConnected) return;
+
+                    var responseJson = JsonConvert.SerializeObject(response);
+                    var responseBytes = Encoding.UTF8.GetBytes(responseJson + "\n");
+                    var stream = this.client.GetStream();
+                    stream.Write(responseBytes, 0, responseBytes.Length);
+
+                    if (DetailedLogs)
+                    {
+                        Debug.Log($"[McpClient] Sent response: {responseJson}");
                     }
                 }
+                catch (JsonReaderException)
+                {
+                    if (isLastSegment)
+                    {
+                        // Last segment wasn't valid JSON — buffer it for the next receive
+                        this.incompleteData = segment;
 
-                this.incompleteData = ""; // Reset incomplete data
+                        if (DetailedLogs)
+                        {
+                            Debug.Log($"[McpClient] Buffering incomplete JSON segment for next receive");
+                        }
+                    }
+                    else
+                    {
+                        // Mid-stream segment that isn't valid JSON — something is wrong, skip it
+                        Debug.LogWarning($"[McpClient] Skipping malformed JSON segment: {segment.Substring(0, Math.Min(100, segment.Length))}");
+                    }
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"Error processing command: {e.Message}");
+
+                    // Send error response
+                    if (this.IsConnected)
+                    {
+                        var errorResponse = new JObject
+                        {
+                            ["status"] = "error",
+                            ["message"] = e.Message
+                        };
+
+                        var errorJson = JsonConvert.SerializeObject(errorResponse);
+                        var errorBytes = Encoding.UTF8.GetBytes(errorJson + "\n");
+                        var stream = this.client.GetStream();
+                        stream.Write(errorBytes, 0, errorBytes.Length);
+
+                        if (DetailedLogs)
+                        {
+                            Debug.Log($"[McpClient] Sent error response: {errorJson}");
+                        }
+                    }
+                }
             }
         }
 
@@ -709,40 +746,41 @@ namespace UnityMCP.Editor.Core
 
             // Execute the resource fetch in the main thread
             JObject result = null;
-            var waitHandle = new ManualResetEvent(false);
-
-            // Queue the resource fetch for the main thread
-            this.ExecuteOnMainThread(() =>
+            using (var waitHandle = new ManualResetEvent(false))
             {
-                try
+                // Queue the resource fetch for the main thread
+                this.ExecuteOnMainThread(() =>
                 {
-                    result = this.FetchResourceData(resourceName, parameters);
-                }
-                catch (Exception e)
+                    try
+                    {
+                        result = this.FetchResourceData(resourceName, parameters);
+                    }
+                    catch (Exception e)
+                    {
+                        result = new JObject
+                        {
+                            ["status"] = "error",
+                            ["message"] = $"Error in {resourceName}: {e.Message}",
+                            ["id"] = id
+                        };
+                    }
+                    finally
+                    {
+                        waitHandle.Set();
+                    }
+                });
+
+                // Wait for the command to be executed on the main thread
+                // Timeout after 5 seconds to prevent hanging
+                if (!waitHandle.WaitOne(5000))
                 {
-                    result = new JObject
+                    return new JObject
                     {
                         ["status"] = "error",
-                        ["message"] = $"Error in {resourceName}: {e.Message}",
+                        ["message"] = "Timed out waiting for resource fetch on main thread",
                         ["id"] = id
                     };
                 }
-                finally
-                {
-                    waitHandle.Set();
-                }
-            });
-
-            // Wait for the command to be executed on the main thread
-            // Timeout after 5 seconds to prevent hanging
-            if (!waitHandle.WaitOne(5000))
-            {
-                return new JObject
-                {
-                    ["status"] = "error",
-                    ["message"] = "Timed out waiting for resource fetch on main thread",
-                    ["id"] = id
-                };
             }
 
             // If result is still null, execution failed
@@ -766,19 +804,24 @@ namespace UnityMCP.Editor.Core
         /// </summary>
         private void ProcessMainThreadQueue()
         {
+            // Drain under lock, execute outside — avoids blocking enqueuers during slow handlers
+            Action[] pending;
             lock (this.queueLock)
             {
-                while (this.mainThreadQueue.Count > 0)
+                if (this.mainThreadQueue.Count == 0) return;
+                pending = this.mainThreadQueue.ToArray();
+                this.mainThreadQueue.Clear();
+            }
+
+            foreach (var action in pending)
+            {
+                try
                 {
-                    var action = this.mainThreadQueue.Dequeue();
-                    try
-                    {
-                        action();
-                    }
-                    catch (Exception e)
-                    {
-                        Debug.LogError($"Error executing action on main thread: {e.Message}");
-                    }
+                    action();
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"Error executing action on main thread: {e.Message}");
                 }
             }
         }
@@ -818,81 +861,82 @@ namespace UnityMCP.Editor.Core
 
             // Execute the command in the main thread
             JObject result = null;
-            var waitHandle = new ManualResetEvent(false);
-
-            // Queue the command execution for the main thread
-            this.ExecuteOnMainThread(() =>
+            using (var waitHandle = new ManualResetEvent(false))
             {
-                try
+                // Queue the command execution for the main thread
+                this.ExecuteOnMainThread(() =>
                 {
-                    // Parse command format: "prefix.action"
-                    var parts = commandType.Split('.');
-                    if (parts.Length < 2)
+                    try
                     {
-                        result = new JObject
-                        {
-                            ["status"] = "error",
-                            ["message"] = $"Invalid command format: {commandType}. Expected format: 'prefix.action'",
-                            ["id"] = id
-                        };
-                    }
-                    else
-                    {
-                        var prefix = parts[0];
-                        var action = parts[1];
-
-                        if (this.commandHandlers.TryGetValue(prefix, out var registration) && registration.Enabled)
-                        {
-                            result = registration.Handler.Execute(action, parameters);
-
-                            // Raise command executed event
-                            this.OnCommandExecuted(new CommandExecutedEventArgs(prefix, action, parameters, result));
-                        }
-                        else if (this.commandHandlers.TryGetValue(prefix, out _))
+                        // Parse command format: "prefix.action"
+                        var parts = commandType.Split('.');
+                        if (parts.Length < 2)
                         {
                             result = new JObject
                             {
                                 ["status"] = "error",
-                                ["message"] = $"Command prefix '{prefix}' is disabled",
+                                ["message"] = $"Invalid command format: {commandType}. Expected format: 'prefix.action'",
                                 ["id"] = id
                             };
                         }
                         else
                         {
-                            result = new JObject
+                            var prefix = parts[0];
+                            var action = parts[1];
+
+                            if (this.commandHandlers.TryGetValue(prefix, out var registration) && registration.Enabled)
                             {
-                                ["status"] = "error",
-                                ["message"] = $"Unknown command prefix: {prefix}",
-                                ["id"] = id
-                            };
+                                result = registration.Handler.Execute(action, parameters);
+
+                                // Raise command executed event
+                                this.OnCommandExecuted(new CommandExecutedEventArgs(prefix, action, parameters, result));
+                            }
+                            else if (this.commandHandlers.TryGetValue(prefix, out _))
+                            {
+                                result = new JObject
+                                {
+                                    ["status"] = "error",
+                                    ["message"] = $"Command prefix '{prefix}' is disabled",
+                                    ["id"] = id
+                                };
+                            }
+                            else
+                            {
+                                result = new JObject
+                                {
+                                    ["status"] = "error",
+                                    ["message"] = $"Unknown command prefix: {prefix}",
+                                    ["id"] = id
+                                };
+                            }
                         }
                     }
-                }
-                catch (Exception e)
+                    catch (Exception e)
+                    {
+                        result = new JObject
+                        {
+                            ["status"] = "error",
+                            ["message"] = $"Error in {commandType}: {e.Message}",
+                            ["id"] = id
+                        };
+                    }
+                    finally
+                    {
+                        waitHandle.Set();
+                    }
+                });
+
+                // Wait for the command to be executed on the main thread
+                // Timeout after 5 seconds to prevent hanging
+                if (!waitHandle.WaitOne(5000))
                 {
-                    result = new JObject
+                    return new JObject
                     {
                         ["status"] = "error",
-                        ["message"] = $"Error in {commandType}: {e.Message}",
+                        ["message"] = "Timed out waiting for command execution on main thread",
                         ["id"] = id
                     };
                 }
-                finally
-                {
-                    waitHandle.Set();
-                }
-            });
-
-            // Wait for the command to be executed on the main thread
-            // Timeout after 5 seconds to prevent hanging
-            if (!waitHandle.WaitOne(5000))
-            {
-                return new JObject
-                {
-                    ["status"] = "error",
-                    ["message"] = "Timed out waiting for command execution on main thread",
-                    ["id"] = id
-                };
             }
 
             // If result is still null, execution failed
