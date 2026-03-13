@@ -26,7 +26,7 @@ namespace UnityMCP.Editor.Core
         /// <typeparam name="TService">The service interface type.</typeparam>
         /// <param name="implementation">The service implementation instance.</param>
         /// <exception cref="ArgumentNullException">Thrown if implementation is null.</exception>
-        /// <exception cref="InvalidOperationException">Thrown if the service type is already registered.</exception>
+        /// <remarks>If a service of the same type is already registered, the old one is disposed (if IDisposable) and replaced.</remarks>
         public void RegisterService<TService>(TService implementation) where TService : class
         {
             if (implementation == null)
@@ -37,9 +37,21 @@ namespace UnityMCP.Editor.Core
             var serviceType = typeof(TService);
             lock (this.lockObject)
             {
-                if (this.services.ContainsKey(serviceType))
+                if (this.services.TryGetValue(serviceType, out var existing))
                 {
-                    throw new InvalidOperationException($"Service of type {serviceType.Name} is already registered.");
+                    Debug.LogWarning($"[McpServiceManager] Replacing existing service: {serviceType.Name}");
+                    // Dispose old service if it implements IDisposable
+                    if (existing is IDisposable disposable)
+                    {
+                        try
+                        {
+                            disposable.Dispose();
+                        }
+                        catch (Exception e)
+                        {
+                            Debug.LogWarning($"[McpServiceManager] Error disposing old {serviceType.Name}: {e.Message}");
+                        }
+                    }
                 }
 
                 this.services[serviceType] = implementation;
