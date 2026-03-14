@@ -48,8 +48,9 @@ namespace UnityMCP.Editor.Core
 
         /// <summary>
         /// Initializes the MCP system, registering services and starting the server if configured.
+        /// Can be called from settings UI when no server exists.
         /// </summary>
-        private static void Initialize()
+        internal static void Initialize()
         {
             Debug.Log("Initializing Unity MCP system...");
 
