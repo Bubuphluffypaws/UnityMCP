@@ -23,6 +23,14 @@ namespace UnityMCP.Editor.Handlers
         private static readonly MethodInfo GetEntryInternalMethod;
         private static readonly Type LogEntryType;
 
+        // Cached reflection fields for LogEntry
+        private static readonly FieldInfo ModeField;
+        private static readonly FieldInfo MessageField;
+        private static readonly FieldInfo FileField;
+        private static readonly FieldInfo LineField;
+        private static readonly FieldInfo ColumnField;
+        private static readonly FieldInfo InstanceIDField;
+
         static ConsoleCommandHandler()
         {
             try
@@ -45,12 +53,38 @@ namespace UnityMCP.Editor.Handlers
                 GetFilteringTextMethod = LogEntriesType.GetMethod("GetFilteringText", BindingFlags.Public | BindingFlags.Static);
                 GetEntryInternalMethod = LogEntriesType.GetMethod("GetEntryInternal", BindingFlags.Public | BindingFlags.Static);
 
+                // Null-check each cached method and warn individually
+                if (StartGettingEntriesMethod == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find StartGettingEntries method");
+                if (EndGettingEntriesMethod == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find EndGettingEntries method");
+                if (GetCountMethod == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find GetCount method");
+                if (GetCountsByTypeMethod == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find GetCountsByType method");
+                if (ClearMethod == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find Clear method");
+                if (SetFilteringTextMethod == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find SetFilteringText method");
+                if (GetFilteringTextMethod == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find GetFilteringText method");
+                if (GetEntryInternalMethod == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find GetEntryInternal method");
+
                 // Get LogEntry type
                 LogEntryType = typeof(UnityEditor.EditorWindow).Assembly.GetType("UnityEditor.LogEntry");
                 if (LogEntryType == null)
                 {
                     Debug.LogError("Failed to find LogEntry type via reflection");
+                    return;
                 }
+
+                // Cache field info for LogEntry fields
+                ModeField = LogEntryType.GetField("mode");
+                MessageField = LogEntryType.GetField("message");
+                FileField = LogEntryType.GetField("file");
+                LineField = LogEntryType.GetField("line");
+                ColumnField = LogEntryType.GetField("column");
+                InstanceIDField = LogEntryType.GetField("instanceID");
+
+                if (ModeField == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find 'mode' field on LogEntry");
+                if (MessageField == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find 'message' field on LogEntry");
+                if (FileField == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find 'file' field on LogEntry");
+                if (LineField == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find 'line' field on LogEntry");
+                if (ColumnField == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find 'column' field on LogEntry");
+                if (InstanceIDField == null) Debug.LogWarning("ConsoleCommandHandler: Failed to find 'instanceID' field on LogEntry");
 
                 Debug.Log("Successfully initialized reflection cache for LogEntries");
             }
@@ -78,8 +112,10 @@ namespace UnityMCP.Editor.Handlers
         /// <returns>A JSON object containing the execution result.</returns>
         public JObject Execute(string action, JObject parameters)
         {
-            // Check if reflection init succeeded
-            if (LogEntriesType == null || LogEntryType == null)
+            // Check if reflection init succeeded (types + critical methods)
+            if (LogEntriesType == null || LogEntryType == null ||
+                GetCountMethod == null || StartGettingEntriesMethod == null ||
+                EndGettingEntriesMethod == null || GetEntryInternalMethod == null)
             {
                 return new JObject
                 {
@@ -107,8 +143,8 @@ namespace UnityMCP.Editor.Handlers
         {
             try
             {
-                var startRow = parameters["startRow"]?.Value<int>() ?? 0;
-                var count = parameters["count"]?.Value<int>() ?? 100;
+                var startRow = Math.Max(0, parameters["startRow"]?.Value<int>() ?? 0);
+                var count = Math.Max(0, parameters["count"]?.Value<int>() ?? 100);
 
                 // Ensure we're not exceeding the available logs
                 var totalCount = (int)GetCountMethod.Invoke(null, null);
@@ -144,23 +180,16 @@ namespace UnityMCP.Editor.Handlers
                         var success = (bool)GetEntryInternalMethod.Invoke(null, new object[] { currentRow, logEntry });
 
                         if (!success) continue;
-                        // Extract properties via reflection
-                        var mode = (int)LogEntryType.GetField("mode").GetValue(logEntry);
-                        var message = (string)LogEntryType.GetField("message").GetValue(logEntry);
-                        var file = (string)LogEntryType.GetField("file").GetValue(logEntry);
-                        var line = (int)LogEntryType.GetField("line").GetValue(logEntry);
-                        var column = (int)LogEntryType.GetField("column").GetValue(logEntry);
-                        var instanceID = (int)LogEntryType.GetField("instanceID").GetValue(logEntry);
+                        // Extract properties via cached FieldInfo (skip null fields)
+                        var entry = new JObject();
+                        if (ModeField != null) entry["mode"] = (int)ModeField.GetValue(logEntry);
+                        if (MessageField != null) entry["message"] = (string)MessageField.GetValue(logEntry);
+                        if (FileField != null) entry["file"] = (string)FileField.GetValue(logEntry);
+                        if (LineField != null) entry["line"] = (int)LineField.GetValue(logEntry);
+                        if (ColumnField != null) entry["column"] = (int)ColumnField.GetValue(logEntry);
+                        if (InstanceIDField != null) entry["instanceID"] = (int)InstanceIDField.GetValue(logEntry);
 
-                        logs.Add(new JObject
-                        {
-                            ["mode"] = mode,
-                            ["message"] = message,
-                            ["file"] = file,
-                            ["line"] = line,
-                            ["column"] = column,
-                            ["instanceID"] = instanceID
-                        });
+                        logs.Add(entry);
                     }
 
                     // Get filter text
