@@ -20,6 +20,7 @@ export class UnityConnection extends EventEmitter {
     private requestId: number = 0;
     private clientDataBuffers: Map<string, string> = new Map();
     private clientInfoMap: Map<string, any> = new Map();
+    private stopping: boolean = false;
 
     // UDP broadcast related fields
     private broadcastSocket: dgram.Socket | null = null;
@@ -60,13 +61,20 @@ export class UnityConnection extends EventEmitter {
      * @returns A promise that resolves when the server is started.
      */
     public start(): Promise<void> {
+        // If a previous server instance still exists (e.g. close() hasn't
+        // fired yet), wait for it to fully close before starting a new one.
+        if (this.server) {
+            return new Promise((resolve, reject) => {
+                console.error('[INFO] Waiting for previous server to close before starting');
+                this.server!.close(() => {
+                    this.server = null;
+                    this.start().then(resolve, reject);
+                });
+            });
+        }
+
         return new Promise((resolve, reject) => {
             try {
-                if (this.server) {
-                    console.error('[INFO] Server is already running');
-                    resolve();
-                    return;
-                }
 
                 this.server = net.createServer((socket) => {
                     // New client connection
@@ -135,15 +143,23 @@ export class UnityConnection extends EventEmitter {
                     });
                 });
 
-                // Handle server errors
+                // Handle server errors during startup.
+                // We use a mutable flag so the handler can stop calling
+                // reject() once the listen callback has fired.
+                let startupComplete = false;
+
                 this.server.on('error', (err) => {
                     console.error(`[ERROR] Server error: ${err.message}`);
                     this.emit('error', err);
-                    reject(err);
+                    if (!startupComplete) {
+                        startupComplete = true;
+                        reject(err);
+                    }
                 });
 
                 // Start listening
                 this.server.listen(this.port, this.host, () => {
+                    startupComplete = true;
                     console.error(`[INFO] MCP server listening on ${this.host}:${this.port}`);
                     this.emit('serverStarted', { host: this.host, port: this.port });
 
@@ -255,20 +271,10 @@ export class UnityConnection extends EventEmitter {
             this.processClientMessage(clientId, message);
         }
 
-        // Check if there's data in the buffer that might be a complete message without newline
-        if (buffer.length > 0) {
-            try {
-                // Try to parse as JSON to see if it's complete
-                JSON.parse(buffer);
-
-                // If we reach here, it's valid JSON, so process it
-                const message = buffer.trim();
-                this.clientDataBuffers.set(clientId, '');
-                this.processClientMessage(clientId, message);
-            } catch (err) {
-                // Not complete JSON, keep waiting for more data
-            }
-        }
+        // Remaining buffer data (if any) is held until the next '\n' arrives.
+        // The protocol is newline-delimited JSON — never speculatively parse
+        // partial buffer contents, as valid JSON without a trailing newline
+        // would be processed prematurely and then again when the newline arrives.
     }
 
     /**
@@ -277,7 +283,7 @@ export class UnityConnection extends EventEmitter {
      * @param message The message to process
      */
     private processClientMessage(clientId: string, message: string): void {
-        if (!message) {
+        if (!message || this.stopping) {
             return;
         }
 
@@ -417,7 +423,20 @@ export class UnityConnection extends EventEmitter {
      * Clears all connected Unity clients.
      */
     public clearClients(): void {
-        // Clear all client data
+        // Destroy all sockets so they don't become orphaned
+        for (const [clientId, socket] of this.clients.entries()) {
+            console.error(`[INFO] Destroying socket for client: ${clientId}`);
+            socket.destroy();
+        }
+
+        // Reject all pending requests for every client
+        for (const [id, pending] of this.pendingRequests) {
+            clearTimeout(pending.timer);
+            pending.reject(new Error('All clients cleared'));
+        }
+        this.pendingRequests.clear();
+
+        this.activeClientId = null;
         this.clients.clear();
         this.clientRefs.clear();
         this.clientDataBuffers.clear();
@@ -564,18 +583,23 @@ export class UnityConnection extends EventEmitter {
      * Returns a promise that resolves when the server is fully closed.
      */
     public stop(): Promise<void> {
-        // Reject all pending requests with timer cleanup
+        // Set stopping flag to prevent processClientMessage from
+        // resolving/rejecting promises that we are about to reject below.
+        this.stopping = true;
+
+        // Destroy all client sockets FIRST — this stops 'data' events
+        // and prevents any new messages from being processed.
+        for (const [clientId, socket] of this.clients.entries()) {
+            console.error(`[INFO] Closing connection to client: ${clientId}`);
+            socket.destroy();
+        }
+
+        // Now reject all pending requests (no more data events can race)
         for (const [id, pending] of this.pendingRequests) {
             clearTimeout(pending.timer);
             pending.reject(new Error('Connection closed'));
         }
         this.pendingRequests.clear();
-
-        // Close all client connections
-        for (const [clientId, socket] of this.clients.entries()) {
-            console.error(`[INFO] Closing connection to client: ${clientId}`);
-            socket.destroy();
-        }
 
         this.clients.clear();
         this.clientRefs.clear();
@@ -583,16 +607,20 @@ export class UnityConnection extends EventEmitter {
         this.clientInfoMap.clear();
         this.activeClientId = null;
 
-        // Close the server and wait for it to finish
+        // Close the server and wait for it to finish.
+        // Don't null this.server until the close callback fires,
+        // so start() won't see null and try to bind while still closing.
         return new Promise((resolve) => {
             if (this.server) {
                 this.server.close(() => {
+                    this.server = null;
+                    this.stopping = false;
                     console.error(`[INFO] Server stopped`);
                     this.emit('serverStopped');
                     resolve();
                 });
-                this.server = null;
             } else {
+                this.stopping = false;
                 resolve();
             }
         });
