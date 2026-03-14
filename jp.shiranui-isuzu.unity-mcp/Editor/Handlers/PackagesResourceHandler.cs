@@ -71,10 +71,18 @@ namespace UnityMCP.Editor.Resources
             // List installed packages
             var listRequest = Client.List(true);
 
-            // Wait for the request to complete
-            while (!listRequest.IsCompleted)
+            // Wait for the request to complete (timeout after 30 seconds)
+            int waited = 0;
+            while (!listRequest.IsCompleted && waited < 30000)
             {
                 Thread.Sleep(100);
+                waited += 100;
+            }
+
+            if (!listRequest.IsCompleted)
+            {
+                Debug.LogError("Timed out waiting for package list request to complete");
+                return result;
             }
 
             if (listRequest.Status == StatusCode.Success)
@@ -103,10 +111,18 @@ namespace UnityMCP.Editor.Resources
             // Search Unity registry packages
             var searchRequest = Client.SearchAll();
 
-            // Wait for the request to complete
-            while (!searchRequest.IsCompleted)
+            // Wait for the request to complete (timeout after 30 seconds)
+            int waited = 0;
+            while (!searchRequest.IsCompleted && waited < 30000)
             {
                 Thread.Sleep(100);
+                waited += 100;
+            }
+
+            if (!searchRequest.IsCompleted)
+            {
+                Debug.LogError("Timed out waiting for registry package search to complete");
+                return result;
             }
 
             if (searchRequest.Status == StatusCode.Success)

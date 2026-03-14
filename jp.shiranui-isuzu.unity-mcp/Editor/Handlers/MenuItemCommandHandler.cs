@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -11,6 +12,21 @@ namespace UnityMCP.Editor.Handlers
     /// </summary>
     internal sealed class MenuItemCommandHandler : IMcpCommandHandler
     {
+        /// <summary>
+        /// Menu items that are blocked because they may trigger modal dialogs or destructive actions.
+        /// </summary>
+        private static readonly HashSet<string> BlockedMenuItems = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "File/Exit",
+            "File/Quit",
+            "File/Build Settings...",
+            "File/Build And Run",
+            "Assets/Delete",
+            "Edit/Preferences...",
+            "Edit/Project Settings...",
+            "Window/Package Manager"
+        };
+
         /// <summary>
         /// Gets the command prefix for this handler.
         /// </summary>
@@ -55,6 +71,26 @@ namespace UnityMCP.Editor.Handlers
                 {
                     ["success"] = false,
                     ["error"] = "MenuItem parameter is required"
+                };
+            }
+
+            // Check blocklist before executing
+            if (BlockedMenuItems.Contains(menuItemPath))
+            {
+                return new JObject
+                {
+                    ["success"] = false,
+                    ["error"] = $"Menu item '{menuItemPath}' is blocked — may trigger modal dialog or destructive action"
+                };
+            }
+
+            // Verify the menu item exists
+            if (!this.HasMenuItem(menuItemPath))
+            {
+                return new JObject
+                {
+                    ["success"] = false,
+                    ["error"] = $"Menu item '{menuItemPath}' does not exist"
                 };
             }
 
