@@ -12,6 +12,7 @@ export class UnityConnection extends EventEmitter {
     private static instance: UnityConnection | null = null;
     private server: net.Server | null = null;
     private clients: Map<string, net.Socket> = new Map();
+    private clientRefs: Map<net.Socket, { id: string }> = new Map();
     private activeClientId: string | null = null;
     private port: number = 27182; // Default port
     private host: string = '127.0.0.1';
@@ -72,6 +73,11 @@ export class UnityConnection extends EventEmitter {
                     const clientId = `unity-${socket.remoteAddress}:${socket.remotePort}`;
                     console.error(`[INFO] New Unity client connected: ${clientId}`);
 
+                    // Use a mutable ref so closures always see the current ID
+                    // (handleRegistration updates ref.id when renaming)
+                    const clientRef = { id: clientId };
+                    this.clientRefs.set(socket, clientRef);
+
                     // Initialize buffer for this client
                     this.clientDataBuffers.set(clientId, '');
 
@@ -91,23 +97,26 @@ export class UnityConnection extends EventEmitter {
                         port: socket.remotePort
                     });
 
-                    // Set up data handling
-                    socket.on('data', (data) => this.handleClientData(clientId, data));
+                    // Set up data handling — closures read clientRef.id so they
+                    // automatically pick up the renamed ID after registration
+                    socket.on('data', (data) => this.handleClientData(clientRef.id, data));
 
                     // Handle disconnection
                     socket.on('close', () => {
-                        console.error(`[INFO] Unity client disconnected: ${clientId}`);
+                        const currentId = clientRef.id;
+                        console.error(`[INFO] Unity client disconnected: ${currentId}`);
 
                         // Reject all pending requests for this client immediately
                         // instead of waiting for the 30-second timeout
-                        this.rejectPendingRequestsForClient(clientId);
+                        this.rejectPendingRequestsForClient(currentId);
 
-                        this.clients.delete(clientId);
-                        this.clientDataBuffers.delete(clientId);
-                        this.clientInfoMap.delete(clientId);
+                        this.clients.delete(currentId);
+                        this.clientDataBuffers.delete(currentId);
+                        this.clientInfoMap.delete(currentId);
+                        this.clientRefs.delete(socket);
 
                         // Update active client if this was the active one
-                        if (this.activeClientId === clientId) {
+                        if (this.activeClientId === currentId) {
                             this.activeClientId = this.clients.size > 0 ?
                                 [...this.clients.keys()][0] : null;
 
@@ -116,13 +125,13 @@ export class UnityConnection extends EventEmitter {
                             }
                         }
 
-                        this.emit('clientDisconnected', { clientId });
+                        this.emit('clientDisconnected', { clientId: currentId });
                     });
 
                     // Handle errors
                     socket.on('error', (err) => {
-                        console.error(`[ERROR] Socket error for client ${clientId}: ${err.message}`);
-                        this.emit('clientError', { clientId, error: err });
+                        console.error(`[ERROR] Socket error for client ${clientRef.id}: ${err.message}`);
+                        this.emit('clientError', { clientId: clientRef.id, error: err });
                     });
                 });
 
@@ -342,6 +351,26 @@ export class UnityConnection extends EventEmitter {
         const socket = this.clients.get(clientId);
         if (!socket) return;
 
+        // If a different socket already owns this newClientId, evict it first
+        if (newClientId !== clientId) {
+            const existingSocket = this.clients.get(newClientId);
+            if (existingSocket && existingSocket !== socket) {
+                console.error(`[WARN] Client ID ${newClientId} already registered — disconnecting previous socket`);
+
+                // Reject pending requests aimed at the old socket
+                this.rejectPendingRequestsForClient(newClientId);
+
+                // Clean up maps for the old socket
+                this.clients.delete(newClientId);
+                this.clientDataBuffers.delete(newClientId);
+                this.clientInfoMap.delete(newClientId);
+                this.clientRefs.delete(existingSocket);
+
+                // Destroy the old socket (fires 'close' but maps are already cleaned)
+                existingSocket.destroy();
+            }
+        }
+
         // Update from temporary ID to persistent ID
         this.clients.delete(clientId);
         this.clients.set(newClientId, socket);
@@ -350,6 +379,12 @@ export class UnityConnection extends EventEmitter {
         const buffer = this.clientDataBuffers.get(clientId) || '';
         this.clientDataBuffers.delete(clientId);
         this.clientDataBuffers.set(newClientId, buffer);
+
+        // Update the mutable ref so existing closures see the new ID
+        const ref = this.clientRefs.get(socket);
+        if (ref) {
+            ref.id = newClientId;
+        }
 
         // Store client info
         this.clientInfoMap.set(newClientId, clientInfo);
@@ -384,6 +419,7 @@ export class UnityConnection extends EventEmitter {
     public clearClients(): void {
         // Clear all client data
         this.clients.clear();
+        this.clientRefs.clear();
         this.clientDataBuffers.clear();
         this.clientInfoMap.clear();
     }
@@ -542,6 +578,7 @@ export class UnityConnection extends EventEmitter {
         }
 
         this.clients.clear();
+        this.clientRefs.clear();
         this.clientDataBuffers.clear();
         this.clientInfoMap.clear();
         this.activeClientId = null;
