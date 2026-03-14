@@ -19,8 +19,8 @@ namespace UnityMCP.Editor.Core
     internal sealed class McpServer : IDisposable
     {
         // Server configuration
-        private string host;
-        private int port;
+        private volatile string host;
+        private volatile int port;
         private volatile bool running;
         private TcpClient client;
         private Thread clientThread;
@@ -42,9 +42,12 @@ namespace UnityMCP.Editor.Core
 
         private CancellationTokenSource cancellationTokenSource;
 
+        // Lock for serializing connection attempts and protecting client access
+        private readonly object connectionLock = new object();
+
         // Connection state
-        private bool isConnecting;
-        private bool isReconnecting;
+        private volatile bool isConnecting;
+        private volatile bool isReconnecting;
         private DateTime lastConnectionAttempt = DateTime.MinValue;
         private readonly int reconnectDelay = 5000; // 5 seconds
         private readonly int maxReconnectDelay = 60000; // 1 minute
@@ -166,8 +169,8 @@ namespace UnityMCP.Editor.Core
                     IsBackground = true,
                     Name = "McpClientThread"
                 };
-                this.clientThread.Start(this.cancellationTokenSource.Token);
                 this.running = true;
+                this.clientThread.Start(this.cancellationTokenSource.Token);
                 Debug.Log($"MCP client started, connecting to {this.host}:{this.port}");
 
                 // Start UDP listener if enabled in settings
@@ -190,24 +193,38 @@ namespace UnityMCP.Editor.Core
         {
             this.running = false;
 
+            // Unregister from editor update to stop processing the queue
+            EditorApplication.update -= this.ProcessMainThreadQueue;
+
+            // Cancel the token to signal the background thread to exit
+            // Do NOT dispose the CTS here — it is disposed in Dispose()
             this.cancellationTokenSource?.Cancel();
-            this.cancellationTokenSource?.Dispose();
-            this.cancellationTokenSource = null;
 
-            if (this.client != null)
-            {
-                this.client.Close();
-                this.client = null;
-            }
-
+            // Wait for the background thread to exit BEFORE closing the client
             if (this.clientThread is { IsAlive: true })
             {
-                this.clientThread.Join(1000); // Wait for the thread to finish
+                this.clientThread.Join(10000);
                 this.clientThread = null;
+            }
+
+            // Now that the thread has exited, safely close the client
+            lock (this.connectionLock)
+            {
+                if (this.client != null)
+                {
+                    this.client.Close();
+                    this.client = null;
+                }
             }
 
             // Stop UDP listener
             this.StopUdpListener();
+
+            // Drain the main thread queue
+            lock (this.queueLock)
+            {
+                this.mainThreadQueue.Clear();
+            }
 
             Debug.Log("MCP client stopped");
         }
@@ -447,8 +464,11 @@ namespace UnityMCP.Editor.Core
             }
             finally
             {
-                this.client?.Close();
-                this.client = null;
+                lock (this.connectionLock)
+                {
+                    this.client?.Close();
+                    this.client = null;
+                }
             }
         }
 
@@ -457,82 +477,85 @@ namespace UnityMCP.Editor.Core
         /// </summary>
         private void TryConnect()
         {
-            // Check if we need to wait before reconnecting
-            if (this.isReconnecting)
+            lock (this.connectionLock)
             {
-                var elapsed = (DateTime.Now - this.lastConnectionAttempt).TotalMilliseconds;
-                if (elapsed < this.currentReconnectDelay)
+                // Check if we need to wait before reconnecting
+                if (this.isReconnecting)
                 {
-                    return;
-                }
-            }
-
-            this.isConnecting = true;
-            this.lastConnectionAttempt = DateTime.Now;
-
-            try
-            {
-                // Close any existing connection
-                if (this.client != null)
-                {
-                    this.client.Close();
-                    this.client = null;
-                }
-
-                // Create new client
-                this.client = new TcpClient();
-
-                // Try to connect with timeout
-                var result = this.client.BeginConnect(this.host, this.port, null, null);
-                var success = result.AsyncWaitHandle.WaitOne(5000); // 5 second timeout
-
-                if (success && this.client.Connected)
-                {
-                    // Connected successfully
-                    this.client.EndConnect(result);
-
-                    // Reset reconnect delay after successful connection
-                    this.currentReconnectDelay = this.reconnectDelay;
-                    this.isReconnecting = false;
-                    this.connectedSince = DateTime.Now;
-
-                    // Clear stale data from previous connection
-                    this.incompleteData = "";
-
-                    Debug.Log($"Connected to MCP TypeScript server at {this.host}:{this.port}");
-
-                    // Send client registration
-                    this.SendClientRegistration();
-
-                    // Raise connected event on main thread
-                    this.ExecuteOnMainThread(() => this.OnConnected(EventArgs.Empty));
-                }
-                else
-                {
-                    // Connection failed
-                    this.client.Close();
-                    this.client = null;
-
-                    if (!this.isReconnecting)
+                    var elapsed = (DateTime.Now - this.lastConnectionAttempt).TotalMilliseconds;
+                    if (elapsed < this.currentReconnectDelay)
                     {
-                        Debug.LogWarning($"Failed to connect to MCP TypeScript server at {this.host}:{this.port}. Will retry...");
-                        this.isReconnecting = true;
+                        return;
+                    }
+                }
+
+                this.isConnecting = true;
+                this.lastConnectionAttempt = DateTime.Now;
+
+                try
+                {
+                    // Close any existing connection
+                    if (this.client != null)
+                    {
+                        this.client.Close();
+                        this.client = null;
                     }
 
-                    // Increase reconnect delay with exponential backoff (capped)
-                    this.currentReconnectDelay = Math.Min(this.currentReconnectDelay * 2, this.maxReconnectDelay);
+                    // Create new client
+                    this.client = new TcpClient();
+
+                    // Try to connect with timeout
+                    var result = this.client.BeginConnect(this.host, this.port, null, null);
+                    var success = result.AsyncWaitHandle.WaitOne(5000); // 5 second timeout
+
+                    if (success && this.client.Connected)
+                    {
+                        // Connected successfully
+                        this.client.EndConnect(result);
+
+                        // Reset reconnect delay after successful connection
+                        this.currentReconnectDelay = this.reconnectDelay;
+                        this.isReconnecting = false;
+                        this.connectedSince = DateTime.Now;
+
+                        // Clear stale data from previous connection
+                        this.incompleteData = "";
+
+                        Debug.Log($"Connected to MCP TypeScript server at {this.host}:{this.port}");
+
+                        // Send client registration
+                        this.SendClientRegistration();
+
+                        // Raise connected event on main thread
+                        this.ExecuteOnMainThread(() => this.OnConnected(EventArgs.Empty));
+                    }
+                    else
+                    {
+                        // Connection failed
+                        this.client.Close();
+                        this.client = null;
+
+                        if (!this.isReconnecting)
+                        {
+                            Debug.LogWarning($"Failed to connect to MCP TypeScript server at {this.host}:{this.port}. Will retry...");
+                            this.isReconnecting = true;
+                        }
+
+                        // Increase reconnect delay with exponential backoff (capped)
+                        this.currentReconnectDelay = Math.Min(this.currentReconnectDelay * 2, this.maxReconnectDelay);
+                    }
                 }
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"Error connecting to MCP TypeScript server: {e.Message}");
-                this.client?.Close();
-                this.client = null;
-                this.isReconnecting = true;
-            }
-            finally
-            {
-                this.isConnecting = false;
+                catch (Exception e)
+                {
+                    Debug.LogError($"Error connecting to MCP TypeScript server: {e.Message}");
+                    this.client?.Close();
+                    this.client = null;
+                    this.isReconnecting = true;
+                }
+                finally
+                {
+                    this.isConnecting = false;
+                }
             }
         }
 
@@ -751,42 +774,59 @@ namespace UnityMCP.Editor.Core
 
             // Execute the resource fetch in the main thread
             JObject result = null;
-            using (var waitHandle = new ManualResetEvent(false))
-            {
-                // Queue the resource fetch for the main thread
-                this.ExecuteOnMainThread(() =>
-                {
-                    try
-                    {
-                        result = this.FetchResourceData(resourceName, parameters);
-                    }
-                    catch (Exception e)
-                    {
-                        result = new JObject
-                        {
-                            ["status"] = "error",
-                            ["message"] = $"Error in {resourceName}: {e.Message}",
-                            ["id"] = id
-                        };
-                    }
-                    finally
-                    {
-                        waitHandle.Set();
-                    }
-                });
+            var waitHandle = new ManualResetEvent(false);
+            // Shared flag: 0 = pending, 1 = done. Used to coordinate disposal between
+            // the timeout path and the lambda so waitHandle.Set() is never called after Dispose().
+            var completed = new int[] { 0 };
 
-                // Wait for the command to be executed on the main thread
-                // Timeout after 5 seconds to prevent hanging
-                if (!waitHandle.WaitOne(5000))
+            // Queue the resource fetch for the main thread
+            this.ExecuteOnMainThread(() =>
+            {
+                try
                 {
-                    return new JObject
+                    result = this.FetchResourceData(resourceName, parameters);
+                }
+                catch (Exception e)
+                {
+                    result = new JObject
                     {
                         ["status"] = "error",
-                        ["message"] = "Timed out waiting for resource fetch on main thread",
+                        ["message"] = $"Error in {resourceName}: {e.Message}",
                         ["id"] = id
                     };
                 }
+                finally
+                {
+                    // Only signal if the caller has not already timed out and disposed
+                    if (Interlocked.Exchange(ref completed[0], 1) == 0)
+                    {
+                        waitHandle.Set();
+                    }
+                }
+            });
+
+            // Wait for the command to be executed on the main thread
+            // Timeout after 5 seconds to prevent hanging
+            if (!waitHandle.WaitOne(5000))
+            {
+                // Mark as timed out so the lambda won't call Set() after we dispose
+                if (Interlocked.Exchange(ref completed[0], 1) == 0)
+                {
+                    // We won the race — lambda hasn't run yet, safe to dispose
+                    waitHandle.Dispose();
+                }
+                // If the lambda already set completed[0]=1, it called Set() before we got here,
+                // which means WaitOne should have returned true. This path means true timeout.
+
+                return new JObject
+                {
+                    ["status"] = "error",
+                    ["message"] = "Timed out waiting for resource fetch on main thread",
+                    ["id"] = id
+                };
             }
+
+            waitHandle.Dispose();
 
             // If result is still null, execution failed
             if (result == null)
@@ -866,83 +906,98 @@ namespace UnityMCP.Editor.Core
 
             // Execute the command in the main thread
             JObject result = null;
-            using (var waitHandle = new ManualResetEvent(false))
+            var waitHandle = new ManualResetEvent(false);
+            // Shared flag: 0 = pending, 1 = done. Used to coordinate disposal between
+            // the timeout path and the lambda so waitHandle.Set() is never called after Dispose().
+            var completed = new int[] { 0 };
+
+            // Queue the command execution for the main thread
+            this.ExecuteOnMainThread(() =>
             {
-                // Queue the command execution for the main thread
-                this.ExecuteOnMainThread(() =>
+                try
                 {
-                    try
+                    // Parse command format: "prefix.action"
+                    var parts = commandType.Split('.');
+                    if (parts.Length < 2)
                     {
-                        // Parse command format: "prefix.action"
-                        var parts = commandType.Split('.');
-                        if (parts.Length < 2)
+                        result = new JObject
+                        {
+                            ["status"] = "error",
+                            ["message"] = $"Invalid command format: {commandType}. Expected format: 'prefix.action'",
+                            ["id"] = id
+                        };
+                    }
+                    else
+                    {
+                        var prefix = parts[0];
+                        var action = parts[1];
+
+                        if (this.commandHandlers.TryGetValue(prefix, out var registration) && registration.Enabled)
+                        {
+                            result = registration.Handler.Execute(action, parameters);
+
+                            // Raise command executed event
+                            this.OnCommandExecuted(new CommandExecutedEventArgs(prefix, action, parameters, result));
+                        }
+                        else if (this.commandHandlers.TryGetValue(prefix, out _))
                         {
                             result = new JObject
                             {
                                 ["status"] = "error",
-                                ["message"] = $"Invalid command format: {commandType}. Expected format: 'prefix.action'",
+                                ["message"] = $"Command prefix '{prefix}' is disabled",
                                 ["id"] = id
                             };
                         }
                         else
                         {
-                            var prefix = parts[0];
-                            var action = parts[1];
-
-                            if (this.commandHandlers.TryGetValue(prefix, out var registration) && registration.Enabled)
+                            result = new JObject
                             {
-                                result = registration.Handler.Execute(action, parameters);
-
-                                // Raise command executed event
-                                this.OnCommandExecuted(new CommandExecutedEventArgs(prefix, action, parameters, result));
-                            }
-                            else if (this.commandHandlers.TryGetValue(prefix, out _))
-                            {
-                                result = new JObject
-                                {
-                                    ["status"] = "error",
-                                    ["message"] = $"Command prefix '{prefix}' is disabled",
-                                    ["id"] = id
-                                };
-                            }
-                            else
-                            {
-                                result = new JObject
-                                {
-                                    ["status"] = "error",
-                                    ["message"] = $"Unknown command prefix: {prefix}",
-                                    ["id"] = id
-                                };
-                            }
+                                ["status"] = "error",
+                                ["message"] = $"Unknown command prefix: {prefix}",
+                                ["id"] = id
+                            };
                         }
                     }
-                    catch (Exception e)
-                    {
-                        result = new JObject
-                        {
-                            ["status"] = "error",
-                            ["message"] = $"Error in {commandType}: {e.Message}",
-                            ["id"] = id
-                        };
-                    }
-                    finally
-                    {
-                        waitHandle.Set();
-                    }
-                });
-
-                // Wait for the command to be executed on the main thread
-                // Timeout after 5 seconds to prevent hanging
-                if (!waitHandle.WaitOne(5000))
+                }
+                catch (Exception e)
                 {
-                    return new JObject
+                    result = new JObject
                     {
                         ["status"] = "error",
-                        ["message"] = "Timed out waiting for command execution on main thread",
+                        ["message"] = $"Error in {commandType}: {e.Message}",
                         ["id"] = id
                     };
                 }
+                finally
+                {
+                    // Only signal if the caller has not already timed out and disposed
+                    if (Interlocked.Exchange(ref completed[0], 1) == 0)
+                    {
+                        waitHandle.Set();
+                    }
+                }
+            });
+
+            // Wait for the command to be executed on the main thread
+            // Timeout after 5 seconds to prevent hanging
+            if (!waitHandle.WaitOne(5000))
+            {
+                // Mark as timed out so the lambda won't call Set() after we dispose
+                if (Interlocked.Exchange(ref completed[0], 1) == 0)
+                {
+                    // We won the race — lambda hasn't run yet, safe to dispose
+                    waitHandle.Dispose();
+                }
+
+                return new JObject
+                {
+                    ["status"] = "error",
+                    ["message"] = "Timed out waiting for command execution on main thread",
+                    ["id"] = id
+                };
             }
+
+            waitHandle.Dispose();
 
             // If result is still null, execution failed
             if (result == null)
@@ -1222,8 +1277,13 @@ namespace UnityMCP.Editor.Core
         {
             this.Stop();
 
-            // Unregister from the update event
+            // Unregister from the update event (also done in Stop, but safe to call twice)
             EditorApplication.update -= this.ProcessMainThreadQueue;
+
+            // Dispose the CancellationTokenSource here rather than in Stop(),
+            // so that Stop() can be called independently without disposing the CTS
+            this.cancellationTokenSource?.Dispose();
+            this.cancellationTokenSource = null;
 
             GC.SuppressFinalize(this);
         }
