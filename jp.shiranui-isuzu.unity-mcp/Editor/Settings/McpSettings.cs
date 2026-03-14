@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+using System;
+using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
 
@@ -6,9 +7,11 @@ namespace UnityMCP.Editor.Settings
 {
     /// <summary>
     /// Stores and manages Unity MCP settings.
+    /// Uses ISerializationCallbackReceiver to serialize Dictionary fields
+    /// as parallel key/value lists, since Unity cannot serialize generic Dictionaries.
     /// </summary>
     [FilePath("UserSettings/UnityMcpSettings.asset", FilePathAttribute.Location.PreferencesFolder)]
-    public sealed class McpSettings : ScriptableSingleton<McpSettings>
+    public sealed class McpSettings : ScriptableSingleton<McpSettings>, ISerializationCallbackReceiver
     {
         /// <summary>
         /// Gets or sets the path to the client installation.
@@ -58,17 +61,65 @@ namespace UnityMCP.Editor.Settings
         [SerializeField]
         public int udpDiscoveryPort = 27183;
 
+        // Serialized backing lists for command handler states
+        [SerializeField] private List<string> handlerKeys = new List<string>();
+        [SerializeField] private List<bool> handlerValues = new List<bool>();
+
+        // Serialized backing lists for resource handler states
+        [SerializeField] private List<string> resourceHandlerKeys = new List<string>();
+        [SerializeField] private List<bool> resourceHandlerValues = new List<bool>();
+
         /// <summary>
-        /// Gets or sets the dictionary of command handlers and their enabled states.
+        /// Runtime dictionary of command handler enabled states, rebuilt from serialized lists.
         /// </summary>
-        [SerializeField]
+        [NonSerialized]
         public Dictionary<string, bool> handlerEnabledStates = new Dictionary<string, bool>();
 
         /// <summary>
-        /// Gets or sets the dictionary of resource handlers and their enabled states.
+        /// Runtime dictionary of resource handler enabled states, rebuilt from serialized lists.
         /// </summary>
-        [SerializeField]
+        [NonSerialized]
         public Dictionary<string, bool> resourceHandlerEnabledStates = new Dictionary<string, bool>();
+
+        /// <summary>
+        /// Synchronizes runtime dictionaries to serialized lists before Unity serializes this object.
+        /// </summary>
+        public void OnBeforeSerialize()
+        {
+            this.handlerKeys.Clear();
+            this.handlerValues.Clear();
+            foreach (var kvp in this.handlerEnabledStates)
+            {
+                this.handlerKeys.Add(kvp.Key);
+                this.handlerValues.Add(kvp.Value);
+            }
+
+            this.resourceHandlerKeys.Clear();
+            this.resourceHandlerValues.Clear();
+            foreach (var kvp in this.resourceHandlerEnabledStates)
+            {
+                this.resourceHandlerKeys.Add(kvp.Key);
+                this.resourceHandlerValues.Add(kvp.Value);
+            }
+        }
+
+        /// <summary>
+        /// Rebuilds runtime dictionaries from serialized lists after Unity deserializes this object.
+        /// </summary>
+        public void OnAfterDeserialize()
+        {
+            this.handlerEnabledStates = new Dictionary<string, bool>();
+            for (int i = 0; i < this.handlerKeys.Count && i < this.handlerValues.Count; i++)
+            {
+                this.handlerEnabledStates[this.handlerKeys[i]] = this.handlerValues[i];
+            }
+
+            this.resourceHandlerEnabledStates = new Dictionary<string, bool>();
+            for (int i = 0; i < this.resourceHandlerKeys.Count && i < this.resourceHandlerValues.Count; i++)
+            {
+                this.resourceHandlerEnabledStates[this.resourceHandlerKeys[i]] = this.resourceHandlerValues[i];
+            }
+        }
 
         /// <summary>
         /// Saves the settings to disk.
