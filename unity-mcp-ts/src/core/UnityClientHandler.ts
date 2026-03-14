@@ -14,7 +14,6 @@ export function registerUnityClientTools(server: McpServer): void {
     server.tool(
         "unity_listClients",
         "Lists all connected Unity projects",
-        {},
         async () => {
             const clients = connection.getConnectedClients();
 
@@ -149,7 +148,6 @@ export function registerUnityClientTools(server: McpServer): void {
     server.tool(
         "unity_getActiveClient",
         "Get information about the currently active Unity project",
-        {},
         async () => {
             if (!connection.hasConnectedClients()) {
                 return {

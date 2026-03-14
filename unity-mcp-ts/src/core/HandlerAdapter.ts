@@ -183,8 +183,9 @@ export class HandlerAdapter {
             }
             const toolCallback = async (params: any) => {
                 try {
-                    // Extract the action from the tool name (e.g., "menu_execute" -> "execute")
-                    const action = toolName.split('_')[1] || 'execute';
+                    // Extract the action from the tool name (e.g., "menu_execute" -> "execute", "console_get_logs" -> "get_logs")
+                    const underscoreIndex = toolName.indexOf('_');
+                    const action = underscoreIndex !== -1 ? toolName.substring(underscoreIndex + 1) : 'execute';
 
                     // Execute the command and await the result
                     const result = await handler.execute(action, params);
