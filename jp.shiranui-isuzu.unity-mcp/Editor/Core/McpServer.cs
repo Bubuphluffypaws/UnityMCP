@@ -604,8 +604,17 @@ namespace UnityMCP.Editor.Core
         {
             try
             {
+                // Acquire a reference to the client under lock so Stop() can't
+                // null it out between our null-check and the stream access.
+                TcpClient localClient;
+                lock (this.connectionLock)
+                {
+                    localClient = this.client;
+                }
+                if (localClient == null || !localClient.Connected) return;
+
                 // Check if there's data available
-                var stream = this.client.GetStream();
+                var stream = localClient.GetStream();
                 if (!stream.DataAvailable) return;
 
                 // Read available data
@@ -620,9 +629,12 @@ namespace UnityMCP.Editor.Core
             {
                 Debug.LogError($"Error processing incoming data: {e.Message}");
 
-                // Close connection on error
-                this.client?.Close();
-                this.client = null;
+                // Close connection on error — use lock to avoid racing with Stop()
+                lock (this.connectionLock)
+                {
+                    this.client?.Close();
+                    this.client = null;
+                }
 
                 // Notify disconnection on main thread
                 this.ExecuteOnMainThread(() => this.OnDisconnected(EventArgs.Empty));
@@ -638,6 +650,13 @@ namespace UnityMCP.Editor.Core
             // Add incoming data to any incomplete data from previous receives
             var fullData = this.incompleteData + data;
             this.incompleteData = "";
+
+            // Guard against unbounded accumulation from malformed data (no newlines)
+            if (fullData.Length > 1024 * 1024)
+            {
+                Debug.LogWarning($"[McpClient] Discarding oversized buffer ({fullData.Length} bytes) — likely malformed data");
+                return;
+            }
 
             // Split on newline — TCP can deliver multiple JSON messages in one read
             var segments = fullData.Split('\n');
@@ -707,14 +726,28 @@ namespace UnityMCP.Editor.Core
                 {
                     Debug.LogError($"Error processing command: {e.Message}");
 
-                    // Send error response
+                    // Send error response — extract id from the raw segment so the
+                    // TS side can match this to the pending request instead of hanging
+                    // for 30 seconds on the timeout.
                     if (this.IsConnected)
                     {
+                        string requestId = null;
+                        try
+                        {
+                            var parsed = JObject.Parse(segment);
+                            requestId = parsed["id"]?.ToString();
+                        }
+                        catch { /* segment already parsed successfully above, this shouldn't fail */ }
+
                         var errorResponse = new JObject
                         {
                             ["status"] = "error",
                             ["message"] = e.Message
                         };
+                        if (requestId != null)
+                        {
+                            errorResponse["id"] = requestId;
+                        }
 
                         var errorJson = JsonConvert.SerializeObject(errorResponse);
                         var errorBytes = Encoding.UTF8.GetBytes(errorJson + "\n");
@@ -805,18 +838,14 @@ namespace UnityMCP.Editor.Core
                 }
             });
 
-            // Wait for the command to be executed on the main thread
-            // Timeout after 5 seconds to prevent hanging
+            // Wait for the resource fetch to complete on the main thread
             if (!waitHandle.WaitOne(5000))
             {
-                // Mark as timed out so the lambda won't call Set() after we dispose
-                if (Interlocked.Exchange(ref completed[0], 1) == 0)
-                {
-                    // We won the race — lambda hasn't run yet, safe to dispose
-                    waitHandle.Dispose();
-                }
-                // If the lambda already set completed[0]=1, it called Set() before we got here,
-                // which means WaitOne should have returned true. This path means true timeout.
+                // Mark as timed out so the lambda won't call Set() after we dispose.
+                // If the lambda already completed (race), it already called Set() and
+                // won't touch waitHandle again, so we can safely dispose here too.
+                Interlocked.Exchange(ref completed[0], 1);
+                waitHandle.Dispose();
 
                 return new JObject
                 {
@@ -979,15 +1008,15 @@ namespace UnityMCP.Editor.Core
             });
 
             // Wait for the command to be executed on the main thread
-            // Timeout after 5 seconds to prevent hanging
-            if (!waitHandle.WaitOne(5000))
+            // Use 30s for code.execute (complex operations), 5s for everything else
+            var timeoutMs = string.Equals(commandType, "code.execute", StringComparison.OrdinalIgnoreCase) ? 30000 : 5000;
+            if (!waitHandle.WaitOne(timeoutMs))
             {
-                // Mark as timed out so the lambda won't call Set() after we dispose
-                if (Interlocked.Exchange(ref completed[0], 1) == 0)
-                {
-                    // We won the race — lambda hasn't run yet, safe to dispose
-                    waitHandle.Dispose();
-                }
+                // Mark as timed out so the lambda won't call Set() after we dispose.
+                // If the lambda already completed (race), it already called Set() and
+                // won't touch waitHandle again, so we can safely dispose here too.
+                Interlocked.Exchange(ref completed[0], 1);
+                waitHandle.Dispose();
 
                 return new JObject
                 {
