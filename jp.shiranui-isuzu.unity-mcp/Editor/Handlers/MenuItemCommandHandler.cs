@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Reflection;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -116,12 +117,37 @@ namespace UnityMCP.Editor.Handlers
 
         /// <summary>
         /// Checks whether a menu item with the specified path exists in the Unity Editor menu.
+        /// Uses EditorApplication.ExecuteMenuItem validation where possible, falling back to
+        /// TypeCache for [MenuItem]-attributed methods. Built-in Unity menu items (registered
+        /// natively, not via [MenuItem]) are not found by TypeCache — so we also check via
+        /// the internal Menu.MenuItemExists API if available.
         /// </summary>
         /// <param name="menuItemPath">The path of the menu item to check.</param>
         /// <returns><c>true</c> if the menu item exists; otherwise, <c>false</c>.</returns>
         private bool HasMenuItem(string menuItemPath)
         {
-            // Check if the menu item exists
+            // First, try the internal EditorUtility method that covers ALL menu items
+            // (both built-in and [MenuItem]-registered). This handles items like
+            // "Assets/Refresh", "Edit/Play", etc. that TypeCache can't find.
+            try
+            {
+                var menuType = typeof(EditorWindow).Assembly.GetType("UnityEditor.Menu");
+                if (menuType != null)
+                {
+                    var menuItemExistsMethod = menuType.GetMethod("MenuItemExists",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                    if (menuItemExistsMethod != null)
+                    {
+                        return (bool)menuItemExistsMethod.Invoke(null, new object[] { menuItemPath });
+                    }
+                }
+            }
+            catch
+            {
+                // Fall through to TypeCache check if reflection fails
+            }
+
+            // Fallback: check [MenuItem]-attributed methods via TypeCache
             var methodsWithAttribute = TypeCache.GetMethodsWithAttribute<MenuItem>();
             foreach (var method in methodsWithAttribute)
             {
