@@ -156,6 +156,10 @@ namespace UnityMCP.Editor.Core
 
             try
             {
+                // Re-register the main thread queue processor (Stop removes it)
+                EditorApplication.update -= this.ProcessMainThreadQueue;
+                EditorApplication.update += this.ProcessMainThreadQueue;
+
                 // Re-read host/port from settings in case they changed
                 var settings = McpSettings.instance;
                 this.host = settings.host;
