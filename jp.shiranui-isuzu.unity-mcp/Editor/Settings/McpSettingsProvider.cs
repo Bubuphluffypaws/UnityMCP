@@ -96,11 +96,55 @@ namespace UnityMCP.Editor.Settings
         }
 
         /// <summary>
+        /// Ensures styles and icons are initialized. Safe to call every OnGUI frame.
+        /// Handles domain reload where OnActivate may not be re-called.
+        /// </summary>
+        private void EnsureStylesInitialized()
+        {
+            if (this.headerStyle == null)
+            {
+                this.headerStyle = new GUIStyle(EditorStyles.boldLabel)
+                {
+                    fontSize = 14,
+                    margin = new RectOffset(0, 0, 10, 5)
+                };
+            }
+
+            if (this.subHeaderStyle == null)
+            {
+                this.subHeaderStyle = new GUIStyle(EditorStyles.boldLabel)
+                {
+                    fontSize = 12,
+                    margin = new RectOffset(0, 0, 5, 3)
+                };
+            }
+
+            if (this.descriptionStyle == null)
+            {
+                this.descriptionStyle = new GUIStyle(EditorStyles.miniLabel)
+                {
+                    wordWrap = true
+                };
+            }
+
+            if (this.enabledIcon == null)
+            {
+                this.enabledIcon = EditorGUIUtility.IconContent("TestPassed");
+            }
+
+            if (this.disabledIcon == null)
+            {
+                this.disabledIcon = EditorGUIUtility.IconContent("TestFailed");
+            }
+        }
+
+        /// <summary>
         /// Draws the settings UI.
         /// </summary>
         /// <param name="searchContext">The search context.</param>
         public override void OnGUI(string searchContext)
         {
+            this.EnsureStylesInitialized();
             EditorGUI.BeginChangeCheck();
 
             GUILayout.Label("TypeScript MCP Settings", this.headerStyle);
@@ -392,7 +436,7 @@ namespace UnityMCP.Editor.Settings
                 GUILayout.Label("Client ID:", GUILayout.Width(120));
 
                 // Truncate ID for display and add copy button
-                var clientId = server.ClientId;
+                var clientId = server.ClientId ?? "(unknown)";
                 var shortId = clientId.Length > 40 ? clientId.Substring(0, 37) + "..." : clientId;
                 GUILayout.Label(shortId);
 
