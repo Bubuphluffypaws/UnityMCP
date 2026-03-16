@@ -20,6 +20,10 @@ export class SceneCommandHandler extends BaseCommandHandler {
     protected async executeCommand(action: string, parameters: JObject): Promise<JObject> {
         switch (action.toLowerCase()) {
             case "screenshot":
+            case "orbit":
+            case "frameobject":
+            case "setcamera":
+            case "getcamera":
             case "inspectmaterial":
             case "previewtexture":
             case "setparameter":
@@ -28,7 +32,7 @@ export class SceneCommandHandler extends BaseCommandHandler {
             default:
                 return {
                     success: false,
-                    error: `Unknown action: ${action}. Supported: screenshot, inspectMaterial, previewTexture, setParameter, getParameters`
+                    error: `Unknown action: ${action}. Supported: screenshot, orbit, frameObject, setCamera, getCamera, inspectMaterial, previewTexture, setParameter, getParameters`
                 };
         }
     }
@@ -45,6 +49,62 @@ export class SceneCommandHandler extends BaseCommandHandler {
             },
             annotations: {
                 title: "Take Scene Screenshot",
+                readOnlyHint: true,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_orbit", {
+            description: "Orbits the Scene View camera around its current pivot. Positive yaw = rotate right, positive pitch = rotate up. Use with scene_screenshot for multi-angle visual iteration.",
+            parameterSchema: {
+                yaw: z.number().optional().describe("Horizontal rotation in degrees (positive = right)"),
+                pitch: z.number().optional().describe("Vertical rotation in degrees (positive = up, clamped to ±89°)")
+            },
+            annotations: {
+                title: "Orbit Camera",
+                readOnlyHint: false,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_frameObject", {
+            description: "Frames the Scene View on a specific GameObject. Centers the camera on the object's bounds. Optionally set camera angle and zoom.",
+            parameterSchema: {
+                object: z.string().describe("GameObject name or hierarchy path to frame on"),
+                size: z.number().optional().describe("Camera zoom distance (smaller = closer)"),
+                yaw: z.number().optional().describe("Set camera yaw angle in degrees (0 = front, 90 = right side, 180 = back)"),
+                pitch: z.number().optional().describe("Set camera pitch angle in degrees (0 = level, negative = looking down)")
+            },
+            annotations: {
+                title: "Frame Object",
+                readOnlyHint: false,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_setCamera", {
+            description: "Directly sets Scene View camera properties. All parameters optional — only specified values change.",
+            parameterSchema: {
+                pivotX: z.number().optional().describe("Camera orbit center X"),
+                pivotY: z.number().optional().describe("Camera orbit center Y"),
+                pivotZ: z.number().optional().describe("Camera orbit center Z"),
+                yaw: z.number().optional().describe("Camera yaw angle in degrees"),
+                pitch: z.number().optional().describe("Camera pitch angle in degrees"),
+                size: z.number().optional().describe("Camera zoom distance"),
+                orthographic: z.boolean().optional().describe("Enable orthographic projection")
+            },
+            annotations: {
+                title: "Set Camera",
+                readOnlyHint: false,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_getCamera", {
+            description: "Returns the current Scene View camera state: pivot, rotation, size, and projection mode.",
+            parameterSchema: {},
+            annotations: {
+                title: "Get Camera",
                 readOnlyHint: true,
                 openWorldHint: false
             }
