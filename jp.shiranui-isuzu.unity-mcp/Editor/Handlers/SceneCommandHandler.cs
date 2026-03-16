@@ -17,13 +17,17 @@ namespace UnityMCP.Editor.Handlers
     {
         public string CommandPrefix => "scene";
 
-        public string Description => "Scene view tools: screenshots, material inspection, texture preview, parameter control";
+        public string Description => "Scene view tools: screenshots, camera control, material inspection, texture preview, parameter control";
 
         public JObject Execute(string action, JObject parameters)
         {
             return action.ToLower() switch
             {
                 "screenshot" => TakeScreenshot(parameters),
+                "orbit" => OrbitCamera(parameters),
+                "frameobject" => FrameObject(parameters),
+                "setcamera" => SetCamera(parameters),
+                "getcamera" => GetCamera(parameters),
                 "inspectmaterial" => InspectMaterial(parameters),
                 "previewtexture" => PreviewTexture(parameters),
                 "setparameter" => SetParameter(parameters),
@@ -31,7 +35,7 @@ namespace UnityMCP.Editor.Handlers
                 _ => new JObject
                 {
                     ["success"] = false,
-                    ["error"] = $"Unknown action: {action}. Supported: screenshot, inspectMaterial, previewTexture, setParameter, getParameters"
+                    ["error"] = $"Unknown action: {action}. Supported: screenshot, orbit, frameObject, setCamera, getCamera, inspectMaterial, previewTexture, setParameter, getParameters"
                 }
             };
         }
@@ -121,6 +125,238 @@ namespace UnityMCP.Editor.Handlers
                 };
             }
         }
+
+        /// <summary>
+        /// Orbits the Scene View camera around its current pivot point.
+        /// Angles are in degrees. Positive yaw = rotate right, positive pitch = rotate up.
+        /// </summary>
+        private static JObject OrbitCamera(JObject parameters)
+        {
+            try
+            {
+                var sceneView = SceneView.lastActiveSceneView;
+                if (sceneView == null)
+                    return new JObject { ["success"] = false, ["error"] = "No active Scene View." };
+
+                var yaw = parameters["yaw"]?.Value<float>() ?? 0f;
+                var pitch = parameters["pitch"]?.Value<float>() ?? 0f;
+
+                var currentRot = sceneView.rotation;
+                var euler = currentRot.eulerAngles;
+
+                euler.y += yaw;
+                euler.x += pitch;
+
+                // Clamp pitch to avoid flipping
+                if (euler.x > 180f) euler.x -= 360f;
+                euler.x = Mathf.Clamp(euler.x, -89f, 89f);
+
+                sceneView.rotation = Quaternion.Euler(euler);
+                sceneView.Repaint();
+
+                return new JObject
+                {
+                    ["success"] = true,
+                    ["rotation"] = $"({euler.x:F1}, {euler.y:F1}, {euler.z:F1})",
+                    ["pivot"] = FormatVector3(sceneView.pivot),
+                    ["size"] = sceneView.size
+                };
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"Orbit failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Frames the Scene View on a specific GameObject by name or path.
+        /// Optionally sets the camera distance (size).
+        /// </summary>
+        private static JObject FrameObject(JObject parameters)
+        {
+            try
+            {
+                var sceneView = SceneView.lastActiveSceneView;
+                if (sceneView == null)
+                    return new JObject { ["success"] = false, ["error"] = "No active Scene View." };
+
+                var objectName = parameters["object"]?.ToString();
+                if (string.IsNullOrEmpty(objectName))
+                    return new JObject { ["success"] = false, ["error"] = "Parameter 'object' (GameObject name or path) is required." };
+
+                // Try full path first, then search by name
+                var go = GameObject.Find(objectName);
+                if (go == null)
+                {
+                    // Search all objects including inactive
+                    foreach (var t in UnityEngine.Object.FindObjectsOfType<Transform>(true))
+                    {
+                        if (t.name == objectName)
+                        {
+                            go = t.gameObject;
+                            break;
+                        }
+                    }
+                }
+
+                if (go == null)
+                    return new JObject { ["success"] = false, ["error"] = $"GameObject '{objectName}' not found." };
+
+                // Calculate bounds from all renderers on this object and children
+                var bounds = new Bounds(go.transform.position, Vector3.zero);
+                bool hasBounds = false;
+                foreach (var r in go.GetComponentsInChildren<Renderer>(true))
+                {
+                    if (!hasBounds)
+                    {
+                        bounds = r.bounds;
+                        hasBounds = true;
+                    }
+                    else
+                    {
+                        bounds.Encapsulate(r.bounds);
+                    }
+                }
+
+                if (!hasBounds)
+                {
+                    // No renderers, just center on the transform
+                    bounds = new Bounds(go.transform.position, Vector3.one * 0.5f);
+                }
+
+                // Frame on the bounds
+                sceneView.Frame(bounds, false);
+
+                // Override size if specified
+                var size = parameters["size"]?.Value<float>();
+                if (size.HasValue && size.Value > 0)
+                {
+                    sceneView.size = size.Value;
+                }
+
+                // Override rotation if specified
+                var yaw = parameters["yaw"]?.Value<float>();
+                var pitch = parameters["pitch"]?.Value<float>();
+                if (yaw.HasValue || pitch.HasValue)
+                {
+                    var euler = sceneView.rotation.eulerAngles;
+                    if (yaw.HasValue) euler.y = yaw.Value;
+                    if (pitch.HasValue) euler.x = pitch.Value;
+                    if (euler.x > 180f) euler.x -= 360f;
+                    euler.x = Mathf.Clamp(euler.x, -89f, 89f);
+                    sceneView.rotation = Quaternion.Euler(euler);
+                }
+
+                sceneView.Repaint();
+
+                return new JObject
+                {
+                    ["success"] = true,
+                    ["framed"] = objectName,
+                    ["pivot"] = FormatVector3(sceneView.pivot),
+                    ["size"] = sceneView.size,
+                    ["rotation"] = FormatVector3(sceneView.rotation.eulerAngles)
+                };
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"FrameObject failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Directly sets the Scene View camera position, rotation, pivot, and zoom.
+        /// All parameters are optional — only specified values are changed.
+        /// </summary>
+        private static JObject SetCamera(JObject parameters)
+        {
+            try
+            {
+                var sceneView = SceneView.lastActiveSceneView;
+                if (sceneView == null)
+                    return new JObject { ["success"] = false, ["error"] = "No active Scene View." };
+
+                // Pivot (orbit center point)
+                if (parameters["pivotX"] != null || parameters["pivotY"] != null || parameters["pivotZ"] != null)
+                {
+                    var pivot = sceneView.pivot;
+                    if (parameters["pivotX"] != null) pivot.x = parameters["pivotX"].Value<float>();
+                    if (parameters["pivotY"] != null) pivot.y = parameters["pivotY"].Value<float>();
+                    if (parameters["pivotZ"] != null) pivot.z = parameters["pivotZ"].Value<float>();
+                    sceneView.pivot = pivot;
+                }
+
+                // Rotation (euler angles)
+                if (parameters["yaw"] != null || parameters["pitch"] != null)
+                {
+                    var euler = sceneView.rotation.eulerAngles;
+                    if (parameters["yaw"] != null) euler.y = parameters["yaw"].Value<float>();
+                    if (parameters["pitch"] != null) euler.x = parameters["pitch"].Value<float>();
+                    if (euler.x > 180f) euler.x -= 360f;
+                    euler.x = Mathf.Clamp(euler.x, -89f, 89f);
+                    sceneView.rotation = Quaternion.Euler(euler);
+                }
+
+                // Size (zoom distance)
+                if (parameters["size"] != null)
+                {
+                    sceneView.size = parameters["size"].Value<float>();
+                }
+
+                // Orthographic mode
+                if (parameters["orthographic"] != null)
+                {
+                    sceneView.orthographic = parameters["orthographic"].Value<bool>();
+                }
+
+                sceneView.Repaint();
+
+                return new JObject
+                {
+                    ["success"] = true,
+                    ["pivot"] = FormatVector3(sceneView.pivot),
+                    ["rotation"] = FormatVector3(sceneView.rotation.eulerAngles),
+                    ["size"] = sceneView.size,
+                    ["orthographic"] = sceneView.orthographic
+                };
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"SetCamera failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Returns the current Scene View camera state.
+        /// </summary>
+        private static JObject GetCamera(JObject parameters)
+        {
+            try
+            {
+                var sceneView = SceneView.lastActiveSceneView;
+                if (sceneView == null)
+                    return new JObject { ["success"] = false, ["error"] = "No active Scene View." };
+
+                var cam = sceneView.camera;
+                return new JObject
+                {
+                    ["success"] = true,
+                    ["pivot"] = FormatVector3(sceneView.pivot),
+                    ["rotation"] = FormatVector3(sceneView.rotation.eulerAngles),
+                    ["size"] = sceneView.size,
+                    ["orthographic"] = sceneView.orthographic,
+                    ["cameraPosition"] = cam != null ? FormatVector3(cam.transform.position) : "null",
+                    ["nearClip"] = cam?.nearClipPlane,
+                    ["farClip"] = cam?.farClipPlane
+                };
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"GetCamera failed: {ex.Message}" };
+            }
+        }
+
+        private static string FormatVector3(Vector3 v) => $"({v.x:F3}, {v.y:F3}, {v.z:F3})";
 
         /// <summary>
         /// Inspects a material by name or renderer path, returning all properties.
