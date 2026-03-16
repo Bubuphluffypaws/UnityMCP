@@ -36,10 +36,14 @@ namespace UnityMCP.Editor.Handlers
                 "setdefault" => SetDefault(parameters),
                 "getanimparams" => GetAnimatorParams(parameters),
                 "setanimparam" => SetAnimatorParam(parameters),
+                "findobjects" => FindObjects(parameters),
+                "inspectobject" => InspectObject(parameters),
+                "getstate" => GetState(parameters),
+                "searchlogs" => SearchLogs(parameters),
                 _ => new JObject
                 {
                     ["success"] = false,
-                    ["error"] = $"Unknown action: {action}. Supported: screenshot, orbit, frameObject, setCamera, getCamera, inspectMaterial, previewTexture, setParameter, getParameters, listToggles, setDefault, getAnimParams, setAnimParam"
+                    ["error"] = $"Unknown action: {action}. Supported: screenshot, orbit, frameObject, setCamera, getCamera, inspectMaterial, previewTexture, setParameter, getParameters, listToggles, setDefault, getAnimParams, setAnimParam, findObjects, inspectObject, getState, searchLogs"
                 }
             };
         }
@@ -805,6 +809,346 @@ namespace UnityMCP.Editor.Handlers
             }
 
             return null; // GestureManager found but API not compatible
+        }
+
+        // ========== Hierarchy / State / Log Tools ==========
+
+        /// <summary>
+        /// Finds GameObjects by name, tag, component type, or path pattern.
+        /// Returns name, path, active state, and component list for each match.
+        /// </summary>
+        private static JObject FindObjects(JObject parameters)
+        {
+            try
+            {
+                var nameFilter = parameters["name"]?.ToString();
+                var tag = parameters["tag"]?.ToString();
+                var component = parameters["component"]?.ToString();
+                var parent = parameters["parent"]?.ToString();
+                var maxResults = parameters["maxResults"]?.Value<int>() ?? 50;
+                var includeInactive = parameters["includeInactive"]?.Value<bool>() ?? true;
+
+                var results = new JArray();
+                var allTransforms = UnityEngine.Object.FindObjectsOfType<Transform>(includeInactive);
+
+                foreach (var t in allTransforms)
+                {
+                    if (results.Count >= maxResults) break;
+
+                    // Filter by parent
+                    if (!string.IsNullOrEmpty(parent))
+                    {
+                        bool underParent = false;
+                        var cur = t.parent;
+                        while (cur != null)
+                        {
+                            if (cur.name == parent || cur.gameObject.name == parent) { underParent = true; break; }
+                            cur = cur.parent;
+                        }
+                        if (!underParent) continue;
+                    }
+
+                    // Filter by name (contains, case-insensitive)
+                    if (!string.IsNullOrEmpty(nameFilter) &&
+                        t.name.IndexOf(nameFilter, StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+
+                    // Filter by tag
+                    if (!string.IsNullOrEmpty(tag))
+                    {
+                        try { if (!t.CompareTag(tag)) continue; }
+                        catch { continue; } // invalid tag
+                    }
+
+                    // Filter by component type
+                    if (!string.IsNullOrEmpty(component))
+                    {
+                        bool hasComp = false;
+                        foreach (var c in t.GetComponents<Component>())
+                        {
+                            if (c != null && c.GetType().Name.IndexOf(component, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                hasComp = true;
+                                break;
+                            }
+                        }
+                        if (!hasComp) continue;
+                    }
+
+                    // Build path
+                    var path = BuildPath(t);
+
+                    // Component names
+                    var comps = new JArray();
+                    foreach (var c in t.GetComponents<Component>())
+                    {
+                        if (c != null) comps.Add(c.GetType().Name);
+                    }
+
+                    results.Add(new JObject
+                    {
+                        ["name"] = t.name,
+                        ["path"] = path,
+                        ["active"] = t.gameObject.activeInHierarchy,
+                        ["activeSelf"] = t.gameObject.activeSelf,
+                        ["childCount"] = t.childCount,
+                        ["components"] = comps
+                    });
+                }
+
+                return new JObject
+                {
+                    ["success"] = true,
+                    ["count"] = results.Count,
+                    ["results"] = results
+                };
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"FindObjects failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Inspects a specific GameObject: transform, all components with key properties,
+        /// children list, and renderer/material info.
+        /// </summary>
+        private static JObject InspectObject(JObject parameters)
+        {
+            try
+            {
+                var objectPath = parameters["object"]?.ToString();
+                if (string.IsNullOrEmpty(objectPath))
+                    return new JObject { ["success"] = false, ["error"] = "Parameter 'object' (name or path) is required." };
+
+                // Find by path first, then by name
+                var go = GameObject.Find(objectPath);
+                if (go == null)
+                {
+                    foreach (var t in UnityEngine.Object.FindObjectsOfType<Transform>(true))
+                    {
+                        if (t.name == objectPath) { go = t.gameObject; break; }
+                    }
+                }
+                if (go == null)
+                    return new JObject { ["success"] = false, ["error"] = $"GameObject '{objectPath}' not found." };
+
+                var result = new JObject
+                {
+                    ["success"] = true,
+                    ["name"] = go.name,
+                    ["path"] = BuildPath(go.transform),
+                    ["active"] = go.activeInHierarchy,
+                    ["activeSelf"] = go.activeSelf,
+                    ["layer"] = LayerMask.LayerToName(go.layer),
+                    ["tag"] = go.tag,
+                    ["isStatic"] = go.isStatic
+                };
+
+                // Transform
+                result["transform"] = new JObject
+                {
+                    ["localPosition"] = FormatVector3(go.transform.localPosition),
+                    ["localRotation"] = FormatVector3(go.transform.localEulerAngles),
+                    ["localScale"] = FormatVector3(go.transform.localScale),
+                    ["worldPosition"] = FormatVector3(go.transform.position)
+                };
+
+                // Components with key properties
+                var comps = new JArray();
+                foreach (var c in go.GetComponents<Component>())
+                {
+                    if (c == null) { comps.Add(new JObject { ["type"] = "(missing script)" }); continue; }
+
+                    var entry = new JObject { ["type"] = c.GetType().Name };
+
+                    // Extract useful info from common component types
+                    if (c is Renderer renderer)
+                    {
+                        entry["enabled"] = renderer.enabled;
+                        var matNames = new JArray();
+                        foreach (var m in renderer.sharedMaterials)
+                            matNames.Add(m != null ? m.name : "null");
+                        entry["materials"] = matNames;
+
+                        if (renderer is SkinnedMeshRenderer smr && smr.sharedMesh != null)
+                        {
+                            entry["mesh"] = smr.sharedMesh.name;
+                            entry["vertexCount"] = smr.sharedMesh.vertexCount;
+                            entry["blendShapeCount"] = smr.sharedMesh.blendShapeCount;
+                        }
+                    }
+                    else if (c is Animator anim)
+                    {
+                        entry["controller"] = anim.runtimeAnimatorController != null
+                            ? anim.runtimeAnimatorController.name : "null";
+                        entry["enabled"] = anim.enabled;
+                    }
+                    else if (c is Behaviour behaviour)
+                    {
+                        entry["enabled"] = behaviour.enabled;
+                    }
+
+                    comps.Add(entry);
+                }
+                result["components"] = comps;
+
+                // Children (direct)
+                var children = new JArray();
+                for (int i = 0; i < go.transform.childCount; i++)
+                {
+                    var child = go.transform.GetChild(i);
+                    children.Add(new JObject
+                    {
+                        ["name"] = child.name,
+                        ["active"] = child.gameObject.activeSelf,
+                        ["childCount"] = child.childCount
+                    });
+                }
+                result["children"] = children;
+                result["childCount"] = go.transform.childCount;
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"InspectObject failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Returns editor state: play mode, scene name, avatar info, connection status.
+        /// </summary>
+        private static JObject GetState(JObject parameters)
+        {
+            try
+            {
+                var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+
+                var result = new JObject
+                {
+                    ["success"] = true,
+                    ["isPlaying"] = Application.isPlaying,
+                    ["isPaused"] = EditorApplication.isPaused,
+                    ["isCompiling"] = EditorApplication.isCompiling,
+                    ["sceneName"] = scene.name,
+                    ["scenePath"] = scene.path,
+                    ["sceneDirty"] = scene.isDirty,
+                    ["unityVersion"] = Application.unityVersion,
+                    ["platform"] = Application.platform.ToString()
+                };
+
+                // Avatar info
+                var descType = FindType("VRC.SDK3.Avatars.Components.VRCAvatarDescriptor");
+                if (descType != null)
+                {
+                    var descriptors = UnityEngine.Object.FindObjectsOfType(descType, true);
+                    var avatars = new JArray();
+                    foreach (Component d in descriptors)
+                    {
+                        avatars.Add(new JObject
+                        {
+                            ["name"] = d.gameObject.name,
+                            ["active"] = d.gameObject.activeInHierarchy
+                        });
+                    }
+                    result["avatars"] = avatars;
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"GetState failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Searches recent console logs for a pattern without changing the persistent filter.
+        /// Returns matching log entries.
+        /// </summary>
+        private static JObject SearchLogs(JObject parameters)
+        {
+            try
+            {
+                var pattern = parameters["pattern"]?.ToString();
+                if (string.IsNullOrEmpty(pattern))
+                    return new JObject { ["success"] = false, ["error"] = "Parameter 'pattern' is required." };
+
+                var maxResults = parameters["maxResults"]?.Value<int>() ?? 50;
+                var caseSensitive = parameters["caseSensitive"]?.Value<bool>() ?? false;
+
+                // Use LogEntries reflection (same as ConsoleCommandHandler)
+                var logEntriesType = typeof(EditorWindow).Assembly.GetType("UnityEditor.LogEntries");
+                var logEntryType = typeof(EditorWindow).Assembly.GetType("UnityEditor.LogEntry");
+                if (logEntriesType == null || logEntryType == null)
+                    return new JObject { ["success"] = false, ["error"] = "LogEntries reflection not available." };
+
+                var getCount = logEntriesType.GetMethod("GetCount", BindingFlags.Public | BindingFlags.Static);
+                var startGetting = logEntriesType.GetMethod("StartGettingEntries", BindingFlags.Public | BindingFlags.Static);
+                var endGetting = logEntriesType.GetMethod("EndGettingEntries", BindingFlags.Public | BindingFlags.Static);
+                var getEntry = logEntriesType.GetMethod("GetEntryInternal", BindingFlags.Public | BindingFlags.Static);
+                var messageField = logEntryType.GetField("message");
+                var modeField = logEntryType.GetField("mode");
+
+                if (getCount == null || startGetting == null || endGetting == null || getEntry == null || messageField == null)
+                    return new JObject { ["success"] = false, ["error"] = "LogEntries methods not found." };
+
+                var totalCount = (int)getCount.Invoke(null, null);
+                startGetting.Invoke(null, null);
+
+                try
+                {
+                    var matches = new JArray();
+                    var comparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+
+                    // Search from newest to oldest
+                    for (int i = totalCount - 1; i >= 0 && matches.Count < maxResults; i--)
+                    {
+                        var logEntry = Activator.CreateInstance(logEntryType);
+                        if (!(bool)getEntry.Invoke(null, new object[] { i, logEntry })) continue;
+
+                        var message = (string)messageField.GetValue(logEntry);
+                        if (message == null || message.IndexOf(pattern, comparison) < 0) continue;
+
+                        // Truncate long messages
+                        var displayMsg = message.Length > 500 ? message.Substring(0, 500) + "..." : message;
+
+                        var entry = new JObject
+                        {
+                            ["row"] = i,
+                            ["message"] = displayMsg
+                        };
+                        if (modeField != null) entry["mode"] = (int)modeField.GetValue(logEntry);
+
+                        matches.Add(entry);
+                    }
+
+                    return new JObject
+                    {
+                        ["success"] = true,
+                        ["pattern"] = pattern,
+                        ["matchCount"] = matches.Count,
+                        ["totalLogs"] = totalCount,
+                        ["matches"] = matches
+                    };
+                }
+                finally
+                {
+                    endGetting.Invoke(null, null);
+                }
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"SearchLogs failed: {ex.Message}" };
+            }
+        }
+
+        private static string BuildPath(Transform t)
+        {
+            var parts = new System.Collections.Generic.List<string>();
+            while (t != null) { parts.Insert(0, t.name); t = t.parent; }
+            return string.Join("/", parts);
         }
 
         // ========== Toggle / Animator Tools ==========

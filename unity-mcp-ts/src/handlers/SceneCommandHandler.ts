@@ -32,11 +32,15 @@ export class SceneCommandHandler extends BaseCommandHandler {
             case "setdefault":
             case "getanimparams":
             case "setanimparam":
+            case "findobjects":
+            case "inspectobject":
+            case "getstate":
+            case "searchlogs":
                 return this.forwardToUnity(action, parameters);
             default:
                 return {
                     success: false,
-                    error: `Unknown action: ${action}. Supported: screenshot, orbit, frameObject, setCamera, getCamera, inspectMaterial, previewTexture, setParameter, getParameters, listToggles, setDefault, getAnimParams, setAnimParam`
+                    error: `Unknown action: ${action}`
                 };
         }
     }
@@ -210,6 +214,59 @@ export class SceneCommandHandler extends BaseCommandHandler {
             annotations: {
                 title: "Set Animator Parameter",
                 readOnlyHint: false,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_findObjects", {
+            description: "Finds GameObjects by name, component type, tag, or parent. Returns path, active state, child count, and component list for each match.",
+            parameterSchema: {
+                name: z.string().optional().describe("Filter by name (case-insensitive contains match)"),
+                component: z.string().optional().describe("Filter by component type name (e.g. 'SkinnedMeshRenderer', 'ModularAvatarMenuItem')"),
+                tag: z.string().optional().describe("Filter by Unity tag"),
+                parent: z.string().optional().describe("Only return objects under this parent name"),
+                maxResults: z.number().optional().describe("Max results to return (default: 50)"),
+                includeInactive: z.boolean().optional().describe("Include inactive objects (default: true)")
+            },
+            annotations: {
+                title: "Find GameObjects",
+                readOnlyHint: true,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_inspectObject", {
+            description: "Inspects a specific GameObject: transform, all components with key properties (renderer materials, mesh info, animator controller), and direct children list.",
+            parameterSchema: {
+                object: z.string().describe("GameObject name or hierarchy path")
+            },
+            annotations: {
+                title: "Inspect GameObject",
+                readOnlyHint: true,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_getState", {
+            description: "Returns Unity editor state: play/pause/compiling mode, scene name, dirty flag, and list of VRC avatars in scene.",
+            parameterSchema: {},
+            annotations: {
+                title: "Get Editor State",
+                readOnlyHint: true,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_searchLogs", {
+            description: "Searches console logs for a pattern without changing the persistent filter. Returns matching entries from newest to oldest.",
+            parameterSchema: {
+                pattern: z.string().describe("Text pattern to search for (e.g. '[AzukiAI]', 'error', 'NullReference')"),
+                maxResults: z.number().optional().describe("Max matching entries to return (default: 50)"),
+                caseSensitive: z.boolean().optional().describe("Case-sensitive search (default: false)")
+            },
+            annotations: {
+                title: "Search Console Logs",
+                readOnlyHint: true,
                 openWorldHint: false
             }
         });
