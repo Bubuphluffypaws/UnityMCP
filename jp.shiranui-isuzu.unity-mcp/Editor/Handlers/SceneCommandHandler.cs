@@ -32,10 +32,14 @@ namespace UnityMCP.Editor.Handlers
                 "previewtexture" => PreviewTexture(parameters),
                 "setparameter" => SetParameter(parameters),
                 "getparameters" => GetParameters(parameters),
+                "listtoggles" => ListToggles(parameters),
+                "setdefault" => SetDefault(parameters),
+                "getanimparams" => GetAnimatorParams(parameters),
+                "setanimparam" => SetAnimatorParam(parameters),
                 _ => new JObject
                 {
                     ["success"] = false,
-                    ["error"] = $"Unknown action: {action}. Supported: screenshot, orbit, frameObject, setCamera, getCamera, inspectMaterial, previewTexture, setParameter, getParameters"
+                    ["error"] = $"Unknown action: {action}. Supported: screenshot, orbit, frameObject, setCamera, getCamera, inspectMaterial, previewTexture, setParameter, getParameters, listToggles, setDefault, getAnimParams, setAnimParam"
                 }
             };
         }
@@ -801,6 +805,440 @@ namespace UnityMCP.Editor.Handlers
             }
 
             return null; // GestureManager found but API not compatible
+        }
+
+        // ========== Toggle / Animator Tools ==========
+
+        /// <summary>
+        /// Lists all ModularAvatarMenuItem components in the scene with their
+        /// parameter name, isDefault state, and parent hierarchy.
+        /// </summary>
+        private static JObject ListToggles(JObject parameters)
+        {
+            try
+            {
+                var maMenuItemType = FindType("nadena.dev.modular_avatar.core.ModularAvatarMenuItem");
+                if (maMenuItemType == null)
+                    return new JObject { ["success"] = false, ["error"] = "ModularAvatarMenuItem type not found. Is Modular Avatar installed?" };
+
+                var items = UnityEngine.Object.FindObjectsOfType(maMenuItemType, true);
+                var result = new JArray();
+
+                foreach (Component item in items)
+                {
+                    var go = item.gameObject;
+
+                    // Read fields via reflection
+                    var controlField = maMenuItemType.GetField("Control") ??
+                                       maMenuItemType.GetProperty("Control")?.GetMethod != null
+                                           ? null : null;
+                    // Try property
+                    object control = null;
+                    var controlProp = maMenuItemType.GetProperty("Control");
+                    if (controlProp != null)
+                        control = controlProp.GetValue(item);
+                    else
+                    {
+                        var cf = maMenuItemType.GetField("Control");
+                        if (cf != null) control = cf.GetValue(item);
+                    }
+
+                    string paramName = "";
+                    string controlType = "";
+                    float controlValue = 0;
+
+                    if (control != null)
+                    {
+                        var paramObj = control.GetType().GetField("parameter")?.GetValue(control);
+                        if (paramObj != null)
+                            paramName = paramObj.GetType().GetField("name")?.GetValue(paramObj)?.ToString() ?? "";
+
+                        var typeVal = control.GetType().GetField("type")?.GetValue(control);
+                        if (typeVal != null) controlType = typeVal.ToString();
+
+                        var valueField = control.GetType().GetField("value");
+                        if (valueField != null)
+                            controlValue = Convert.ToSingle(valueField.GetValue(control));
+                    }
+
+                    // isDefault
+                    var isDefaultField = maMenuItemType.GetField("isDefault");
+                    bool isDefault = isDefaultField != null && (bool)isDefaultField.GetValue(item);
+
+                    // isSynced, isSaved
+                    var isSyncedField = maMenuItemType.GetField("isSynced");
+                    bool isSynced = isSyncedField != null && (bool)isSyncedField.GetValue(item);
+
+                    var isSavedField = maMenuItemType.GetField("isSaved");
+                    bool isSaved = isSavedField != null && (bool)isSavedField.GetValue(item);
+
+                    // Build path
+                    var path = new System.Text.StringBuilder();
+                    var t = go.transform;
+                    while (t != null)
+                    {
+                        if (path.Length > 0) path.Insert(0, "/");
+                        path.Insert(0, t.name);
+                        t = t.parent;
+                    }
+
+                    result.Add(new JObject
+                    {
+                        ["name"] = go.name,
+                        ["path"] = path.ToString(),
+                        ["parameter"] = paramName,
+                        ["controlType"] = controlType,
+                        ["value"] = controlValue,
+                        ["isDefault"] = isDefault,
+                        ["isSynced"] = isSynced,
+                        ["isSaved"] = isSaved,
+                        ["active"] = go.activeInHierarchy
+                    });
+                }
+
+                return new JObject
+                {
+                    ["success"] = true,
+                    ["count"] = result.Count,
+                    ["toggles"] = result
+                };
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"ListToggles failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Sets isDefault on a ModularAvatarMenuItem by name or parameter name.
+        /// Used for edit-mode toggle testing — set defaults, then rebuild/screenshot.
+        /// </summary>
+        private static JObject SetDefault(JObject parameters)
+        {
+            try
+            {
+                var targetName = parameters["name"]?.ToString();
+                var targetParam = parameters["parameter"]?.ToString();
+                var value = parameters["value"]?.Value<bool>() ?? true;
+
+                if (string.IsNullOrEmpty(targetName) && string.IsNullOrEmpty(targetParam))
+                    return new JObject { ["success"] = false, ["error"] = "Specify 'name' (GameObject name) or 'parameter' (VRC parameter name)." };
+
+                var maMenuItemType = FindType("nadena.dev.modular_avatar.core.ModularAvatarMenuItem");
+                if (maMenuItemType == null)
+                    return new JObject { ["success"] = false, ["error"] = "ModularAvatarMenuItem type not found." };
+
+                var items = UnityEngine.Object.FindObjectsOfType(maMenuItemType, true);
+                var isDefaultField = maMenuItemType.GetField("isDefault");
+                if (isDefaultField == null)
+                    return new JObject { ["success"] = false, ["error"] = "isDefault field not found on ModularAvatarMenuItem." };
+
+                int matched = 0;
+                var matchedNames = new List<string>();
+
+                foreach (Component item in items)
+                {
+                    bool match = false;
+
+                    // Match by GameObject name
+                    if (!string.IsNullOrEmpty(targetName) &&
+                        string.Equals(item.gameObject.name, targetName, StringComparison.OrdinalIgnoreCase))
+                        match = true;
+
+                    // Match by parameter name
+                    if (!string.IsNullOrEmpty(targetParam))
+                    {
+                        var controlProp = maMenuItemType.GetProperty("Control");
+                        object control = controlProp?.GetValue(item);
+                        if (control == null)
+                        {
+                            var cf = maMenuItemType.GetField("Control");
+                            control = cf?.GetValue(item);
+                        }
+                        if (control != null)
+                        {
+                            var paramObj = control.GetType().GetField("parameter")?.GetValue(control);
+                            var pName = paramObj?.GetType().GetField("name")?.GetValue(paramObj)?.ToString() ?? "";
+                            if (string.Equals(pName, targetParam, StringComparison.OrdinalIgnoreCase))
+                                match = true;
+                        }
+                    }
+
+                    if (match)
+                    {
+                        isDefaultField.SetValue(item, value);
+                        EditorUtility.SetDirty(item);
+                        matched++;
+                        matchedNames.Add(item.gameObject.name);
+                    }
+                }
+
+                if (matched == 0)
+                    return new JObject { ["success"] = false, ["error"] = $"No matching MenuItem found for name='{targetName}' parameter='{targetParam}'." };
+
+                return new JObject
+                {
+                    ["success"] = true,
+                    ["matched"] = matched,
+                    ["names"] = new JArray(matchedNames.ToArray()),
+                    ["isDefault"] = value
+                };
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"SetDefault failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Gets all animator parameters and their current values from the avatar's Animator.
+        /// Works in both edit mode (default values) and play mode (live values).
+        /// </summary>
+        private static JObject GetAnimatorParams(JObject parameters)
+        {
+            try
+            {
+                var avatarName = parameters["avatar"]?.ToString();
+                var animator = FindAvatarAnimator(avatarName);
+                if (animator == null)
+                    return new JObject { ["success"] = false, ["error"] = "No avatar Animator found." };
+
+                // In edit mode, read from the controller; in play mode, read live values
+                bool isPlaying = Application.isPlaying;
+                var result = new JArray();
+
+                if (isPlaying && animator.isActiveAndEnabled && animator.runtimeAnimatorController != null)
+                {
+                    // Play mode — read live parameter values
+                    foreach (var param in animator.parameters)
+                    {
+                        var entry = new JObject
+                        {
+                            ["name"] = param.name,
+                            ["type"] = param.type.ToString()
+                        };
+
+                        switch (param.type)
+                        {
+                            case AnimatorControllerParameterType.Bool:
+                                entry["value"] = animator.GetBool(param.name);
+                                break;
+                            case AnimatorControllerParameterType.Int:
+                                entry["value"] = animator.GetInteger(param.name);
+                                break;
+                            case AnimatorControllerParameterType.Float:
+                                entry["value"] = animator.GetFloat(param.name);
+                                break;
+                            case AnimatorControllerParameterType.Trigger:
+                                entry["value"] = false; // triggers are transient
+                                break;
+                        }
+
+                        result.Add(entry);
+                    }
+                }
+                else
+                {
+                    // Edit mode — read from controller definition
+                    var ctrl = animator.runtimeAnimatorController as UnityEditor.Animations.AnimatorController;
+                    if (ctrl != null)
+                    {
+                        foreach (var param in ctrl.parameters)
+                        {
+                            var entry = new JObject
+                            {
+                                ["name"] = param.name,
+                                ["type"] = param.type.ToString()
+                            };
+
+                            switch (param.type)
+                            {
+                                case AnimatorControllerParameterType.Bool:
+                                    entry["value"] = param.defaultBool;
+                                    break;
+                                case AnimatorControllerParameterType.Int:
+                                    entry["value"] = param.defaultInt;
+                                    break;
+                                case AnimatorControllerParameterType.Float:
+                                    entry["value"] = param.defaultFloat;
+                                    break;
+                            }
+
+                            result.Add(entry);
+                        }
+                    }
+                }
+
+                return new JObject
+                {
+                    ["success"] = true,
+                    ["avatar"] = animator.gameObject.name,
+                    ["isPlaying"] = isPlaying,
+                    ["parameterCount"] = result.Count,
+                    ["parameters"] = result
+                };
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"GetAnimParams failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Sets an animator parameter on the avatar. In play mode, sets the live
+        /// value on the Animator. In edit mode, sets the default on the controller.
+        /// </summary>
+        private static JObject SetAnimatorParam(JObject parameters)
+        {
+            try
+            {
+                var paramName = parameters["name"]?.ToString();
+                if (string.IsNullOrEmpty(paramName))
+                    return new JObject { ["success"] = false, ["error"] = "Parameter 'name' is required." };
+
+                var value = parameters["value"];
+                if (value == null)
+                    return new JObject { ["success"] = false, ["error"] = "Parameter 'value' is required." };
+
+                var avatarName = parameters["avatar"]?.ToString();
+                var animator = FindAvatarAnimator(avatarName);
+                if (animator == null)
+                    return new JObject { ["success"] = false, ["error"] = "No avatar Animator found." };
+
+                bool isPlaying = Application.isPlaying;
+
+                if (isPlaying && animator.isActiveAndEnabled)
+                {
+                    // Play mode — set live value
+                    // Determine type from the parameter
+                    foreach (var param in animator.parameters)
+                    {
+                        if (param.name != paramName) continue;
+
+                        switch (param.type)
+                        {
+                            case AnimatorControllerParameterType.Bool:
+                                var boolVal = value.Type == JTokenType.Boolean
+                                    ? value.Value<bool>()
+                                    : value.Value<float>() > 0.5f;
+                                animator.SetBool(paramName, boolVal);
+                                return new JObject
+                                {
+                                    ["success"] = true,
+                                    ["mode"] = "playMode",
+                                    ["parameter"] = paramName,
+                                    ["value"] = boolVal
+                                };
+                            case AnimatorControllerParameterType.Int:
+                                var intVal = value.Value<int>();
+                                animator.SetInteger(paramName, intVal);
+                                return new JObject
+                                {
+                                    ["success"] = true,
+                                    ["mode"] = "playMode",
+                                    ["parameter"] = paramName,
+                                    ["value"] = intVal
+                                };
+                            case AnimatorControllerParameterType.Float:
+                                var floatVal = value.Value<float>();
+                                animator.SetFloat(paramName, floatVal);
+                                return new JObject
+                                {
+                                    ["success"] = true,
+                                    ["mode"] = "playMode",
+                                    ["parameter"] = paramName,
+                                    ["value"] = floatVal
+                                };
+                            case AnimatorControllerParameterType.Trigger:
+                                animator.SetTrigger(paramName);
+                                return new JObject
+                                {
+                                    ["success"] = true,
+                                    ["mode"] = "playMode",
+                                    ["parameter"] = paramName,
+                                    ["triggered"] = true
+                                };
+                        }
+                    }
+
+                    return new JObject { ["success"] = false, ["error"] = $"Parameter '{paramName}' not found on Animator." };
+                }
+                else
+                {
+                    // Edit mode — set default on controller
+                    var ctrl = animator.runtimeAnimatorController as UnityEditor.Animations.AnimatorController;
+                    if (ctrl == null)
+                        return new JObject { ["success"] = false, ["error"] = "No AnimatorController found in edit mode." };
+
+                    var ctrlParams = ctrl.parameters;
+                    for (int i = 0; i < ctrlParams.Length; i++)
+                    {
+                        if (ctrlParams[i].name != paramName) continue;
+
+                        switch (ctrlParams[i].type)
+                        {
+                            case AnimatorControllerParameterType.Bool:
+                                ctrlParams[i].defaultBool = value.Type == JTokenType.Boolean
+                                    ? value.Value<bool>()
+                                    : value.Value<float>() > 0.5f;
+                                break;
+                            case AnimatorControllerParameterType.Int:
+                                ctrlParams[i].defaultInt = value.Value<int>();
+                                break;
+                            case AnimatorControllerParameterType.Float:
+                                ctrlParams[i].defaultFloat = value.Value<float>();
+                                break;
+                        }
+
+                        ctrl.parameters = ctrlParams;
+                        EditorUtility.SetDirty(ctrl);
+
+                        return new JObject
+                        {
+                            ["success"] = true,
+                            ["mode"] = "editMode",
+                            ["parameter"] = paramName,
+                            ["value"] = value
+                        };
+                    }
+
+                    return new JObject { ["success"] = false, ["error"] = $"Parameter '{paramName}' not found on controller." };
+                }
+            }
+            catch (Exception ex)
+            {
+                return new JObject { ["success"] = false, ["error"] = $"SetAnimParam failed: {ex.Message}" };
+            }
+        }
+
+        /// <summary>
+        /// Finds the Animator on the VRC avatar descriptor, or by name.
+        /// </summary>
+        private static Animator FindAvatarAnimator(string avatarName = null)
+        {
+            // If name specified, find that specific object
+            if (!string.IsNullOrEmpty(avatarName))
+            {
+                var go = GameObject.Find(avatarName);
+                if (go != null)
+                {
+                    var anim = go.GetComponent<Animator>();
+                    if (anim != null) return anim;
+                }
+            }
+
+            // Find VRCAvatarDescriptor
+            var descType = FindType("VRC.SDK3.Avatars.Components.VRCAvatarDescriptor");
+            if (descType != null)
+            {
+                var descriptor = UnityEngine.Object.FindObjectOfType(descType) as Component;
+                if (descriptor != null)
+                {
+                    return descriptor.GetComponent<Animator>();
+                }
+            }
+
+            return null;
         }
 
         private static Type FindType(string fullName)

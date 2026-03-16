@@ -28,11 +28,15 @@ export class SceneCommandHandler extends BaseCommandHandler {
             case "previewtexture":
             case "setparameter":
             case "getparameters":
+            case "listtoggles":
+            case "setdefault":
+            case "getanimparams":
+            case "setanimparam":
                 return this.forwardToUnity(action, parameters);
             default:
                 return {
                     success: false,
-                    error: `Unknown action: ${action}. Supported: screenshot, orbit, frameObject, setCamera, getCamera, inspectMaterial, previewTexture, setParameter, getParameters`
+                    error: `Unknown action: ${action}. Supported: screenshot, orbit, frameObject, setCamera, getCamera, inspectMaterial, previewTexture, setParameter, getParameters, listToggles, setDefault, getAnimParams, setAnimParam`
                 };
         }
     }
@@ -156,6 +160,56 @@ export class SceneCommandHandler extends BaseCommandHandler {
             annotations: {
                 title: "Get VRC Parameters",
                 readOnlyHint: true,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_listToggles", {
+            description: "Lists all Modular Avatar MenuItems in the scene with their parameter name, isDefault state, isSynced, isSaved, and hierarchy path. Use isDefault to control which toggles are on by default — visible in edit mode Scene View.",
+            parameterSchema: {},
+            annotations: {
+                title: "List MA Toggles",
+                readOnlyHint: true,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_setDefault", {
+            description: "Sets isDefault on a Modular Avatar MenuItem toggle. When isDefault=true, the toggle is ON by default — visible in edit mode Scene View without entering play mode. Find toggles by name or parameter.",
+            parameterSchema: {
+                name: z.string().optional().describe("GameObject name of the MenuItem (e.g. 'Eye Glow', 'Hair Circuit')"),
+                parameter: z.string().optional().describe("VRC parameter name (e.g. 'AIEyeGlow') — alternative to name"),
+                value: z.boolean().optional().describe("Set isDefault to true (on) or false (off). Default: true")
+            },
+            annotations: {
+                title: "Set Toggle Default",
+                readOnlyHint: false,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_getAnimParams", {
+            description: "Gets all animator parameters and their current values. In play mode: reads live runtime values. In edit mode: reads controller defaults.",
+            parameterSchema: {
+                avatar: z.string().optional().describe("Avatar GameObject name (auto-detected if omitted)")
+            },
+            annotations: {
+                title: "Get Animator Parameters",
+                readOnlyHint: true,
+                openWorldHint: false
+            }
+        });
+
+        tools.set("scene_setAnimParam", {
+            description: "Sets an animator parameter. In play mode: sets live value for immediate visual feedback (toggles, blends). In edit mode: sets controller default.",
+            parameterSchema: {
+                name: z.string().describe("Parameter name (e.g. 'AIEyeGlow', 'AIRim')"),
+                value: z.union([z.boolean(), z.number()]).describe("Value to set (bool for toggles, float for blends, int for enums)"),
+                avatar: z.string().optional().describe("Avatar GameObject name (auto-detected if omitted)")
+            },
+            annotations: {
+                title: "Set Animator Parameter",
+                readOnlyHint: false,
                 openWorldHint: false
             }
         });
