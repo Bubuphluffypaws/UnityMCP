@@ -684,12 +684,7 @@ namespace UnityMCP.Editor.Handlers
                     };
                 }
 
-                // Get expressionParameters via reflection
-                var exprParamsProp = descType.GetProperty("expressionParameters") ??
-                                     descType.GetField("expressionParameters")?.FieldType != null
-                                         ? null : null;
-
-                // Try field access
+                // Try field access for expressionParameters
                 var exprParamsField = descType.GetField("expressionParameters");
                 if (exprParamsField == null)
                 {
@@ -1172,11 +1167,7 @@ namespace UnityMCP.Editor.Handlers
                 {
                     var go = item.gameObject;
 
-                    // Read fields via reflection
-                    var controlField = maMenuItemType.GetField("Control") ??
-                                       maMenuItemType.GetProperty("Control")?.GetMethod != null
-                                           ? null : null;
-                    // Try property
+                    // Read Control via property or field
                     object control = null;
                     var controlProp = maMenuItemType.GetProperty("Control");
                     if (controlProp != null)
